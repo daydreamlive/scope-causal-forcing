@@ -2,6 +2,12 @@
 
 A [Daydream Scope](https://github.com/daydreamlive/scope) plugin that adds the [Causal Forcing](https://github.com/thu-ml/Causal-Forcing) pipeline for real-time streaming video generation.
 
+<p align="center">
+  <img src="assets/demo.gif" width="100%" />
+</p>
+
+> _Real-time streaming generation with Causal Forcing on Wan2.1-1.3B (17 FPS on H100, ~10 FPS on RTX 4090). Video from the [Causal Forcing project page](https://thu-ml.github.io/CausalForcing.github.io/)._
+
 ## What is Causal Forcing?
 
 Causal Forcing (Tsinghua / Shengshu / UT Austin, Feb 2026) is the successor to Self-Forcing -- the training method behind Scope's built-in LongLive pipeline. It fixes a theoretical flaw in Self-Forcing's ODE initialization by using an autoregressive teacher instead of a bidirectional one, producing strictly better video quality at identical inference speed.
