@@ -23,6 +23,34 @@ from .schema import CausalForcingConfig
 if TYPE_CHECKING:
     from scope.core.pipelines.schema import BasePipelineConfig
 
+
+def _import_causal_wan_model():
+    """Import CausalWanModel from any available Wan2.1-based pipeline.
+
+    Multiple Scope pipelines bundle their own copy of CausalWanModel. We try
+    several in order of preference so the plugin is not tightly coupled to a
+    single built-in pipeline.
+    """
+    sources = [
+        "scope.core.pipelines.longlive.modules.causal_model",
+        "scope.core.pipelines.streamdiffusionv2.modules.causal_model",
+        "scope.core.pipelines.reward_forcing.modules.causal_model",
+        "scope.core.pipelines.memflow.modules.causal_model",
+        "scope.core.pipelines.krea_realtime_video.modules.causal_model",
+    ]
+    for module_path in sources:
+        try:
+            import importlib
+
+            mod = importlib.import_module(module_path)
+            return mod.CausalWanModel
+        except (ImportError, AttributeError):
+            continue
+    raise ImportError(
+        "Could not import CausalWanModel from any Scope pipeline. "
+        "Ensure at least one Wan2.1-based pipeline is available."
+    )
+
 logger = logging.getLogger(__name__)
 
 # Causal Forcing framewise: 4-step denoising schedule
@@ -52,7 +80,7 @@ class CausalForcingPipeline(Pipeline):
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
     ):
-        from scope.core.pipelines.longlive.modules.causal_model import CausalWanModel
+        CausalWanModel = _import_causal_wan_model()
 
         validate_resolution(
             height=config.height,
