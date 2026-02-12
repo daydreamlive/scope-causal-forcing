@@ -75,12 +75,14 @@ class CausalForcingPipeline(Pipeline):
 
     def __init__(
         self,
-        config,
-        quantization=None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
+        **kwargs,
     ):
         CausalWanModel = _import_causal_wan_model()
+
+        # Build config from kwargs (pipeline_manager passes config fields as kwargs)
+        config = CausalForcingConfig(**kwargs)
 
         validate_resolution(
             height=config.height,
@@ -120,21 +122,19 @@ class CausalForcingPipeline(Pipeline):
         print(f"Loaded text encoder in {time.time() - start:.3f}s")
 
         # Load VAE
-        vae_type = getattr(config, "vae_type", "wan")
         start = time.time()
         vae = create_vae(
             model_dir=model_dir,
             model_name="Wan2.1-T2V-1.3B",
-            vae_type=vae_type,
+            vae_type=config.vae_type,
         )
         vae = vae.to(device=device, dtype=dtype)
-        print(f"Loaded VAE (type={vae_type}) in {time.time() - start:.3f}s")
+        print(f"Loaded VAE (type={config.vae_type}) in {time.time() - start:.3f}s")
 
         # Setup scheduler and warp denoising steps to flow matching sigmas
         self.scheduler = generator.get_scheduler()
-        denoising_steps = getattr(config, "denoising_steps", DEFAULT_DENOISING_STEPS)
         self.denoising_step_list = self._warp_denoising_steps(
-            torch.tensor(denoising_steps, dtype=torch.long)
+            torch.tensor(config.denoising_steps, dtype=torch.long)
         )
 
         # Store components
