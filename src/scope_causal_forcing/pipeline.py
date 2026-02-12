@@ -266,29 +266,37 @@ class CausalForcingPipeline(Pipeline):
         if self.conditional_dict is None:
             self.conditional_dict = self.text_encoder(text_prompts=[""])
 
-        # Generate one block of frames
-        denoised = self._denoise_block()
+        # WanVAE stream_decode requires >= 2 latent frames on the first batch
+        # (CausalConv3d kernel_size=3 needs at least 3 temporal elements including cache).
+        # Generate 2 frames on the first call, 1 frame on subsequent calls.
+        num_frames = 2 if self.current_start_frame == 0 else self.num_frame_per_block
+
+        # Generate block of frames
+        denoised = self._denoise_block(num_frames)
 
         # Update KV cache with clean context (timestep=0)
-        self._cache_clean_context(denoised)
+        self._cache_clean_context(denoised, num_frames)
 
         # Advance frame pointer
-        self.current_start_frame += self.num_frame_per_block
+        self.current_start_frame += num_frames
 
         # Decode latent to pixel space
         video = self.vae.decode_to_pixel(denoised, use_cache=True)
 
         return {"video": postprocess_chunk(video)}
 
-    def _denoise_block(self) -> torch.Tensor:
+    def _denoise_block(self, num_frames: int) -> torch.Tensor:
         """Run the spatial denoising loop for one block of frames.
+
+        Args:
+            num_frames: Number of latent frames to generate in this block.
 
         Returns:
             Denoised latent prediction [B, F, C, H_lat, W_lat]
         """
         # Sample noise for current block
         noisy_input = torch.randn(
-            [1, self.num_frame_per_block, 16, self.height_latent, self.width_latent],
+            [1, num_frames, 16, self.height_latent, self.width_latent],
             device=self.device,
             dtype=self.dtype,
         )
@@ -299,7 +307,7 @@ class CausalForcingPipeline(Pipeline):
         for i, current_timestep in enumerate(self.denoising_step_list):
             timestep = (
                 torch.ones(
-                    [1, self.num_frame_per_block],
+                    [1, num_frames],
                     device=self.device,
                     dtype=torch.int64,
                 )
@@ -323,7 +331,7 @@ class CausalForcingPipeline(Pipeline):
                     torch.randn_like(denoised_pred.flatten(0, 1)),
                     next_timestep
                     * torch.ones(
-                        [self.num_frame_per_block],
+                        [num_frames],
                         device=self.device,
                         dtype=torch.long,
                     ),
@@ -331,14 +339,14 @@ class CausalForcingPipeline(Pipeline):
 
         return denoised_pred
 
-    def _cache_clean_context(self, denoised: torch.Tensor):
+    def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int):
         """Re-run generator at timestep=0 to write clean context into KV cache.
 
         This is essential for autoregressive quality: the KV cache should contain
         representations of clean (denoised) frames, not noisy intermediate states.
         """
         context_timestep = torch.zeros(
-            [1, self.num_frame_per_block],
+            [1, num_frames],
             device=self.device,
             dtype=torch.int64,
         )
