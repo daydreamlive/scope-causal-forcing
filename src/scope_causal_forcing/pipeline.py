@@ -290,9 +290,9 @@ class CausalForcingPipeline(Pipeline):
     def _denoise_block(self, num_frames: int) -> torch.Tensor:
         """Run the spatial denoising loop with Classifier-Free Guidance.
 
-        Uses deterministic Euler ODE steps (matching the reference implementation)
-        instead of stochastic re-noising. Runs the generator twice per step
-        (positive + negative prompt) and combines using the CFG formula.
+        Uses pred_x0 + stochastic re-noising (matching Scope's DenoiseBlock pattern)
+        with dual forward passes for CFG. Applying CFG on pred_x0 is mathematically
+        equivalent to applying it on flow_pred.
 
         Args:
             num_frames: Number of latent frames to generate in this block.
@@ -320,7 +320,7 @@ class CausalForcingPipeline(Pipeline):
             )
 
             # Conditional (positive prompt) forward pass
-            flow_pred_cond, _ = self.generator(
+            _, pred_x0_cond = self.generator(
                 noisy_image_or_video=sample,
                 conditional_dict=self.conditional_dict,
                 timestep=timestep,
@@ -330,7 +330,7 @@ class CausalForcingPipeline(Pipeline):
             )
 
             # Unconditional (negative prompt) forward pass
-            flow_pred_uncond, _ = self.generator(
+            _, pred_x0_uncond = self.generator(
                 noisy_image_or_video=sample,
                 conditional_dict=self.unconditional_dict,
                 timestep=timestep,
@@ -339,23 +339,33 @@ class CausalForcingPipeline(Pipeline):
                 current_start=current_start,
             )
 
-            # Apply Classifier-Free Guidance
-            flow_pred = flow_pred_uncond + self.guidance_scale * (
-                flow_pred_cond - flow_pred_uncond
+            # Apply CFG on x0 predictions (equivalent to CFG on flow_pred)
+            pred_x0 = pred_x0_uncond + self.guidance_scale * (
+                pred_x0_cond - pred_x0_uncond
             )
 
-            # Euler ODE step: sample = sample + flow * (sigma_next - sigma_curr)
-            # sigma = timestep / num_train_timesteps (from scheduler definition)
-            sigma_curr = current_timestep.float() / self.scheduler.num_train_timesteps
             if i < num_steps - 1:
-                sigma_next = (
-                    self.denoising_step_list[i + 1].float()
-                    / self.scheduler.num_train_timesteps
+                # Stochastic re-noising to next timestep level
+                next_timestep = self.denoising_step_list[i + 1]
+                flat_x0 = pred_x0.flatten(0, 1)
+                random_noise = torch.randn(
+                    flat_x0.shape,
+                    device=flat_x0.device,
+                    dtype=flat_x0.dtype,
                 )
+                sample = self.scheduler.add_noise(
+                    flat_x0,
+                    random_noise,
+                    next_timestep
+                    * torch.ones(
+                        [flat_x0.shape[0]],
+                        device=flat_x0.device,
+                        dtype=torch.long,
+                    ),
+                ).unflatten(0, pred_x0.shape[:2])
             else:
-                sigma_next = 0.0  # Final step goes to clean sample
-
-            sample = sample + flow_pred * (sigma_next - sigma_curr)
+                # Last step: use the guided x0 directly
+                sample = pred_x0
 
         return sample
 
