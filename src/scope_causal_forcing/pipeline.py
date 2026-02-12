@@ -2,6 +2,9 @@
 
 Adapted from https://github.com/thu-ml/Causal-Forcing
 Uses Scope's existing Wan2.1 infrastructure with Causal Forcing checkpoint weights.
+
+The DMD (Distribution Matching Distillation) checkpoint is designed for fast 4-step
+inference WITHOUT Classifier-Free Guidance, matching the reference causal_inference.py.
 """
 
 import logging
@@ -54,9 +57,6 @@ def _import_causal_wan_model():
 
 logger = logging.getLogger(__name__)
 
-# Causal Forcing framewise: 4-step denoising schedule
-DEFAULT_DENOISING_STEPS = [1000, 750, 500, 250]
-
 # VAE and patch embedding downsample factors
 VAE_SPATIAL_DOWNSAMPLE = 8
 PATCH_SPATIAL_DOWNSAMPLE = 2
@@ -65,14 +65,6 @@ TOTAL_SPATIAL_DOWNSAMPLE = VAE_SPATIAL_DOWNSAMPLE * PATCH_SPATIAL_DOWNSAMPLE  # 
 # Rolling attention window size (in frames).
 # CausalWanModel requires local_attn_size != -1 for KV cache rolling eviction.
 LOCAL_ATTN_SIZE = 21
-
-# Wan2.1 standard negative prompt (from Causal Forcing configs)
-WAN_NEGATIVE_PROMPT = (
-    "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，"
-    "最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，"
-    "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
-    "杂乱的背景，三条腿，背景人很多，倒着走"
-)
 
 
 class CausalForcingPipeline(Pipeline):
@@ -150,11 +142,19 @@ class CausalForcingPipeline(Pipeline):
         vae = vae.to(device=device, dtype=dtype)
         print(f"Loaded VAE (type={config.vae_type}) in {time.time() - start:.3f}s")
 
-        # Setup scheduler and denoising steps (raw integer timesteps)
+        # Setup scheduler
         self.scheduler = generator.get_scheduler()
-        self.denoising_step_list = torch.tensor(
-            config.denoising_steps, dtype=torch.long
-        )
+
+        # Warp denoising steps through the scheduler's shifted timestep table.
+        # This maps raw indices [1000, 750, 500, 250] to the actual shifted timestep
+        # values the model was trained with (e.g., [1000, 937.5, 833.3, 625.0]).
+        # Reference: Causal-Forcing/model/base.py lines 20-24
+        raw_steps = torch.tensor(config.denoising_steps, dtype=torch.long)
+        scheduler_timesteps = torch.cat([
+            self.scheduler.timesteps.cpu(),
+            torch.tensor([0.0], dtype=torch.float32),
+        ])
+        self.denoising_step_list = scheduler_timesteps[1000 - raw_steps]
 
         # Store components
         self.generator = generator
@@ -162,7 +162,6 @@ class CausalForcingPipeline(Pipeline):
         self.vae = vae
         self.device = device
         self.dtype = dtype
-        self.guidance_scale = config.guidance_scale
 
         # Resolution-dependent constants
         self.height = config.height
@@ -177,16 +176,9 @@ class CausalForcingPipeline(Pipeline):
         # Framewise generation (1 latent frame per block)
         self.num_frame_per_block = 1
 
-        # Pre-encode negative prompt for CFG (constant across all calls)
-        self.unconditional_dict = self.text_encoder(
-            text_prompts=[WAN_NEGATIVE_PROMPT]
-        )
-
-        # Streaming state - dual caches for CFG (positive + negative)
-        self.kv_cache_pos = None
-        self.kv_cache_neg = None
-        self.crossattn_cache_pos = None
-        self.crossattn_cache_neg = None
+        # Streaming state - single KV cache (no CFG for DMD checkpoint)
+        self.kv_cache = None
+        self.crossattn_cache = None
         self.current_start_frame = 0
         self.conditional_dict = None
         self._current_prompt = None
@@ -221,23 +213,17 @@ class CausalForcingPipeline(Pipeline):
         )
 
     def _initialize_caches(self):
-        """Initialize dual KV and cross-attention caches for CFG."""
-        self.kv_cache_pos = self._make_kv_cache()
-        self.kv_cache_neg = self._make_kv_cache()
-        self.crossattn_cache_pos = self._make_crossattn_cache()
-        self.crossattn_cache_neg = self._make_crossattn_cache()
+        """Initialize KV and cross-attention caches."""
+        self.kv_cache = self._make_kv_cache()
+        self.crossattn_cache = self._make_crossattn_cache()
         self.current_start_frame = 0
 
     def _reset_caches(self):
         """Reset caches for a fresh generation sequence."""
-        if self.kv_cache_pos is not None:
-            self.kv_cache_pos = self._make_kv_cache(existing=self.kv_cache_pos)
-            self.kv_cache_neg = self._make_kv_cache(existing=self.kv_cache_neg)
-            self.crossattn_cache_pos = self._make_crossattn_cache(
-                existing=self.crossattn_cache_pos
-            )
-            self.crossattn_cache_neg = self._make_crossattn_cache(
-                existing=self.crossattn_cache_neg
+        if self.kv_cache is not None:
+            self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
+            self.crossattn_cache = self._make_crossattn_cache(
+                existing=self.crossattn_cache
             )
 
         if hasattr(self.vae, "model") and hasattr(self.vae.model, "clear_cache"):
@@ -250,7 +236,7 @@ class CausalForcingPipeline(Pipeline):
         prompts = kwargs.get("prompts")
 
         # Initialize or reset caches
-        if self.kv_cache_pos is None:
+        if self.kv_cache is None:
             self._initialize_caches()
         elif init_cache:
             self._reset_caches()
@@ -273,10 +259,10 @@ class CausalForcingPipeline(Pipeline):
         # WanVAE stream_decode requires >= 2 latent frames on the first batch
         num_frames = 2 if self.current_start_frame == 0 else self.num_frame_per_block
 
-        # Generate block of frames with CFG
+        # Generate block of frames
         denoised = self._denoise_block(num_frames)
 
-        # Update both pos/neg KV caches with clean context (timestep=0)
+        # Update KV cache with clean context (timestep=0)
         self._cache_clean_context(denoised, num_frames)
 
         # Advance frame pointer
@@ -288,11 +274,11 @@ class CausalForcingPipeline(Pipeline):
         return {"video": postprocess_chunk(video)}
 
     def _denoise_block(self, num_frames: int) -> torch.Tensor:
-        """Run the spatial denoising loop with Classifier-Free Guidance.
+        """Run the spatial denoising loop.
 
-        Uses pred_x0 + stochastic re-noising (matching Scope's DenoiseBlock pattern)
-        with dual forward passes for CFG. Applying CFG on pred_x0 is mathematically
-        equivalent to applying it on flow_pred.
+        Uses pred_x0 + stochastic re-noising matching the reference
+        causal_inference.py. The DMD checkpoint produces good x0 predictions
+        in 4 steps without CFG.
 
         Args:
             num_frames: Number of latent frames to generate in this block.
@@ -314,48 +300,27 @@ class CausalForcingPipeline(Pipeline):
                 torch.ones(
                     [1, num_frames],
                     device=self.device,
-                    dtype=torch.float32,
+                    dtype=torch.int64,
                 )
                 * current_timestep
             )
 
-            # Conditional (positive prompt) forward pass
-            _, pred_x0_cond = self.generator(
-                noisy_image_or_video=sample,
-                conditional_dict=self.conditional_dict,
-                timestep=timestep,
-                kv_cache=self.kv_cache_pos,
-                crossattn_cache=self.crossattn_cache_pos,
-                current_start=current_start,
-            )
-
-            # Unconditional (negative prompt) forward pass
-            _, pred_x0_uncond = self.generator(
-                noisy_image_or_video=sample,
-                conditional_dict=self.unconditional_dict,
-                timestep=timestep,
-                kv_cache=self.kv_cache_neg,
-                crossattn_cache=self.crossattn_cache_neg,
-                current_start=current_start,
-            )
-
-            # Apply CFG on x0 predictions (equivalent to CFG on flow_pred)
-            pred_x0 = pred_x0_uncond + self.guidance_scale * (
-                pred_x0_cond - pred_x0_uncond
-            )
-
             if i < num_steps - 1:
+                _, pred_x0 = self.generator(
+                    noisy_image_or_video=sample,
+                    conditional_dict=self.conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start,
+                )
+
                 # Stochastic re-noising to next timestep level
                 next_timestep = self.denoising_step_list[i + 1]
                 flat_x0 = pred_x0.flatten(0, 1)
-                random_noise = torch.randn(
-                    flat_x0.shape,
-                    device=flat_x0.device,
-                    dtype=flat_x0.dtype,
-                )
                 sample = self.scheduler.add_noise(
                     flat_x0,
-                    random_noise,
+                    torch.randn_like(flat_x0),
                     next_timestep
                     * torch.ones(
                         [flat_x0.shape[0]],
@@ -364,40 +329,33 @@ class CausalForcingPipeline(Pipeline):
                     ),
                 ).unflatten(0, pred_x0.shape[:2])
             else:
-                # Last step: use the guided x0 directly
+                # Last step: output pred_x0 directly
+                _, pred_x0 = self.generator(
+                    noisy_image_or_video=sample,
+                    conditional_dict=self.conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.kv_cache,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=current_start,
+                )
                 sample = pred_x0
 
         return sample
 
     def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int):
-        """Re-run generator at timestep=0 to write clean context into both KV caches.
-
-        Both positive and negative caches must be updated for CFG to work
-        correctly on subsequent frames.
-        """
+        """Re-run generator at timestep=0 to write clean context into KV cache."""
         context_timestep = torch.zeros(
             [1, num_frames],
             device=self.device,
-            dtype=torch.float32,
+            dtype=torch.int64,
         )
         current_start = self.current_start_frame * self.frame_seq_length
 
-        # Update positive cache
         self.generator(
             noisy_image_or_video=denoised,
             conditional_dict=self.conditional_dict,
             timestep=context_timestep,
-            kv_cache=self.kv_cache_pos,
-            crossattn_cache=self.crossattn_cache_pos,
-            current_start=current_start,
-        )
-
-        # Update negative cache
-        self.generator(
-            noisy_image_or_video=denoised,
-            conditional_dict=self.unconditional_dict,
-            timestep=context_timestep,
-            kv_cache=self.kv_cache_neg,
-            crossattn_cache=self.crossattn_cache_neg,
+            kv_cache=self.kv_cache,
+            crossattn_cache=self.crossattn_cache,
             current_start=current_start,
         )
