@@ -115,6 +115,39 @@ class CausalForcingPipeline(Pipeline):
         generator = generator.to(device=device, dtype=dtype)
         print(f"Loaded Causal Forcing generator in {time.time() - start:.3f}s")
 
+        # Verify model weights are actually loaded (not all zeros)
+        total_params = 0
+        zero_params = 0
+        for name, param in generator.model.named_parameters():
+            total_params += 1
+            if param.abs().max().item() == 0.0:
+                zero_params += 1
+        print(f"[CF DEBUG] Model params: {total_params} total, {zero_params} all-zero")
+        if zero_params > 0:
+            for name, param in generator.model.named_parameters():
+                if param.abs().max().item() == 0.0:
+                    print(f"[CF DEBUG]   ZERO param: {name} shape={list(param.shape)}")
+                    if total_params - zero_params < 5:
+                        break
+        # Print a few non-zero param stats
+        count = 0
+        for name, param in generator.model.named_parameters():
+            if param.abs().max().item() > 0.0:
+                print(f"[CF DEBUG]   Non-zero param: {name} shape={list(param.shape)} max={param.abs().max().item():.6f}")
+                count += 1
+                if count >= 3:
+                    break
+
+        # Check what _call_model will filter
+        import inspect
+        sig = inspect.signature(generator.model._forward_inference)
+        param_names = list(sig.parameters.keys())
+        print(f"[CF DEBUG] _forward_inference params: {param_names}")
+        has_var_keyword = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+        )
+        print(f"[CF DEBUG] _forward_inference has **kwargs: {has_var_keyword}")
+
         # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
         text_encoder_path = str(
             get_model_file_path("WanVideo_comfy/umt5-xxl-enc-fp8_e4m3fn.safetensors")
