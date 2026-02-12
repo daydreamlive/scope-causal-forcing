@@ -142,10 +142,11 @@ class CausalForcingPipeline(Pipeline):
         vae = vae.to(device=device, dtype=dtype)
         print(f"Loaded VAE (type={config.vae_type}) in {time.time() - start:.3f}s")
 
-        # Setup scheduler and warp denoising steps to flow matching sigmas
+        # Setup scheduler and denoising steps (raw integer timesteps, not warped)
+        # The generator and scheduler internally map integer timesteps to sigmas.
         self.scheduler = generator.get_scheduler()
-        self.denoising_step_list = self._warp_denoising_steps(
-            torch.tensor(config.denoising_steps, dtype=torch.long)
+        self.denoising_step_list = torch.tensor(
+            config.denoising_steps, dtype=torch.long
         )
 
         # Store components
@@ -185,17 +186,6 @@ class CausalForcingPipeline(Pipeline):
         # Resolve from Scope's model directory
         cf_model_dir = str(get_model_file_path("Causal-Forcing"))
         return os.path.join(cf_model_dir, "framewise", "causal_forcing.pt")
-
-    def _warp_denoising_steps(self, steps: torch.Tensor) -> torch.Tensor:
-        """Warp integer denoising steps through the flow matching schedule.
-
-        Maps step indices [1000, 750, 500, 250] to their corresponding sigma
-        values in the flow matching schedule, which improves generation quality.
-        """
-        timesteps = torch.cat(
-            (self.scheduler.timesteps.cpu(), torch.tensor([0.0], dtype=torch.float32))
-        )
-        return timesteps[1000 - steps]
 
     def _initialize_caches(self):
         """Initialize KV and cross-attention caches for autoregressive generation."""
