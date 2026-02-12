@@ -113,10 +113,18 @@ class CausalForcingPipeline(Pipeline):
         print(f"Loaded Causal Forcing generator in {time.time() - start:.3f}s")
 
         # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
+        text_encoder_path = str(
+            get_model_file_path("WanVideo_comfy/umt5-xxl-enc-fp8_e4m3fn.safetensors")
+        )
+        tokenizer_path = str(
+            get_model_file_path("Wan2.1-T2V-1.3B/google/umt5-xxl")
+        )
         start = time.time()
         text_encoder = WanTextEncoderWrapper(
             model_name="Wan2.1-T2V-1.3B",
             model_dir=model_dir,
+            text_encoder_path=text_encoder_path,
+            tokenizer_path=tokenizer_path,
         )
         text_encoder = text_encoder.to(device=device)
         print(f"Loaded text encoder in {time.time() - start:.3f}s")
