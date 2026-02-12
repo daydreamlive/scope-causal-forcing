@@ -16,6 +16,7 @@ from scope.core.pipelines.interface import Pipeline
 from scope.core.pipelines.process import postprocess_chunk
 from scope.core.pipelines.utils import validate_resolution
 from scope.core.pipelines.wan2_1.components import WanDiffusionWrapper, WanTextEncoderWrapper
+from scope.core.pipelines.wan2_1.utils import initialize_crossattn_cache, initialize_kv_cache
 from scope.core.pipelines.wan2_1.vae import create_vae
 
 from .schema import CausalForcingConfig
@@ -56,16 +57,14 @@ logger = logging.getLogger(__name__)
 # Causal Forcing framewise: 4-step denoising schedule
 DEFAULT_DENOISING_STEPS = [1000, 750, 500, 250]
 
-# Wan2.1-1.3B architecture constants
-NUM_TRANSFORMER_BLOCKS = 30
-NUM_HEADS = 12
-HEAD_DIM = 128
-CROSS_ATTN_SEQ_LEN = 512
-
 # VAE and patch embedding downsample factors
 VAE_SPATIAL_DOWNSAMPLE = 8
 PATCH_SPATIAL_DOWNSAMPLE = 2
 TOTAL_SPATIAL_DOWNSAMPLE = VAE_SPATIAL_DOWNSAMPLE * PATCH_SPATIAL_DOWNSAMPLE  # 16
+
+# Rolling attention window size (in frames).
+# CausalWanModel requires local_attn_size != -1 for KV cache rolling eviction.
+LOCAL_ATTN_SIZE = 21
 
 
 class CausalForcingPipeline(Pipeline):
@@ -101,7 +100,7 @@ class CausalForcingPipeline(Pipeline):
         cf_ckpt_path = self._resolve_checkpoint_path(config)
 
         # Load generator: Wan2.1-1.3B base config + Causal Forcing weights
-        # Causal Forcing uses sink_size=0 and no local attention windowing
+        # Causal Forcing uses sink_size=0; local_attn_size enables rolling KV cache eviction
         start = time.time()
         generator = WanDiffusionWrapper(
             CausalWanModel,
@@ -111,6 +110,7 @@ class CausalForcingPipeline(Pipeline):
             generator_model_name="generator_ema",
             timestep_shift=5.0,
             sink_size=0,
+            local_attn_size=LOCAL_ATTN_SIZE,
         )
         generator = generator.to(device=device, dtype=dtype)
         print(f"Loaded Causal Forcing generator in {time.time() - start:.3f}s")
@@ -168,10 +168,6 @@ class CausalForcingPipeline(Pipeline):
         # Framewise generation (1 latent frame per block)
         self.num_frame_per_block = 1
 
-        # KV cache pre-allocation size: enough for 21 latent frames
-        self.max_cached_frames = 21
-        self.kv_cache_size = self.max_cached_frames * self.frame_seq_length
-
         # Streaming state
         self.kv_cache = None
         self.crossattn_cache = None
@@ -203,55 +199,41 @@ class CausalForcingPipeline(Pipeline):
 
     def _initialize_caches(self):
         """Initialize KV and cross-attention caches for autoregressive generation."""
-        self.kv_cache = [
-            {
-                "k": torch.zeros(
-                    [1, self.kv_cache_size, NUM_HEADS, HEAD_DIM],
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                "v": torch.zeros(
-                    [1, self.kv_cache_size, NUM_HEADS, HEAD_DIM],
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                "global_end_index": torch.tensor(
-                    [0], dtype=torch.long, device=self.device
-                ),
-                "local_end_index": torch.tensor(
-                    [0], dtype=torch.long, device=self.device
-                ),
-            }
-            for _ in range(NUM_TRANSFORMER_BLOCKS)
-        ]
-
-        self.crossattn_cache = [
-            {
-                "k": torch.zeros(
-                    [1, CROSS_ATTN_SEQ_LEN, NUM_HEADS, HEAD_DIM],
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                "v": torch.zeros(
-                    [1, CROSS_ATTN_SEQ_LEN, NUM_HEADS, HEAD_DIM],
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                "is_init": False,
-            }
-            for _ in range(NUM_TRANSFORMER_BLOCKS)
-        ]
-
+        self.kv_cache = initialize_kv_cache(
+            generator=self.generator,
+            batch_size=1,
+            dtype=self.dtype,
+            device=self.device,
+            local_attn_size=LOCAL_ATTN_SIZE,
+            frame_seq_length=self.frame_seq_length,
+        )
+        self.crossattn_cache = initialize_crossattn_cache(
+            generator=self.generator,
+            batch_size=1,
+            dtype=self.dtype,
+            device=self.device,
+        )
         self.current_start_frame = 0
 
     def _reset_caches(self):
         """Reset caches for a fresh generation sequence."""
         if self.kv_cache is not None:
-            for cache in self.kv_cache:
-                cache["global_end_index"].fill_(0)
-                cache["local_end_index"].fill_(0)
-            for cache in self.crossattn_cache:
-                cache["is_init"] = False
+            self.kv_cache = initialize_kv_cache(
+                generator=self.generator,
+                batch_size=1,
+                dtype=self.dtype,
+                device=self.device,
+                local_attn_size=LOCAL_ATTN_SIZE,
+                frame_seq_length=self.frame_seq_length,
+                kv_cache_existing=self.kv_cache,
+            )
+            self.crossattn_cache = initialize_crossattn_cache(
+                generator=self.generator,
+                batch_size=1,
+                dtype=self.dtype,
+                device=self.device,
+                crossattn_cache_existing=self.crossattn_cache,
+            )
 
         # Clear VAE decode cache for temporal consistency
         if hasattr(self.vae, "model") and hasattr(self.vae.model, "clear_cache"):
