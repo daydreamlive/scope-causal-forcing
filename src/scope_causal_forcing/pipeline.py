@@ -81,6 +81,9 @@ class CausalForcingPipeline(Pipeline):
     ):
         CausalWanModel = _import_causal_wan_model()
 
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
         # Build config from kwargs (pipeline_manager passes config fields as kwargs)
         config = CausalForcingConfig(**kwargs)
 
