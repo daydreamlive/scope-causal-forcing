@@ -115,38 +115,28 @@ class CausalForcingPipeline(Pipeline):
         generator = generator.to(device=device, dtype=dtype)
         print(f"Loaded Causal Forcing generator in {time.time() - start:.3f}s")
 
-        # Verify model weights are actually loaded (not all zeros)
-        total_params = 0
-        zero_params = 0
-        for name, param in generator.model.named_parameters():
-            total_params += 1
-            if param.abs().max().item() == 0.0:
-                zero_params += 1
-        print(f"[CF DEBUG] Model params: {total_params} total, {zero_params} all-zero")
-        if zero_params > 0:
-            for name, param in generator.model.named_parameters():
-                if param.abs().max().item() == 0.0:
-                    print(f"[CF DEBUG]   ZERO param: {name} shape={list(param.shape)}")
-                    if total_params - zero_params < 5:
-                        break
-        # Print a few non-zero param stats
-        count = 0
-        for name, param in generator.model.named_parameters():
-            if param.abs().max().item() > 0.0:
-                print(f"[CF DEBUG]   Non-zero param: {name} shape={list(param.shape)} max={param.abs().max().item():.6f}")
-                count += 1
-                if count >= 3:
-                    break
-
-        # Check what _call_model will filter
-        import inspect
-        sig = inspect.signature(generator.model._forward_inference)
-        param_names = list(sig.parameters.keys())
-        print(f"[CF DEBUG] _forward_inference params: {param_names}")
-        has_var_keyword = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-        print(f"[CF DEBUG] _forward_inference has **kwargs: {has_var_keyword}")
+        # Diagnose weight loading: compare checkpoint keys vs model parameter names
+        from scope.core.pipelines.utils import load_state_dict as _load_sd
+        _ckpt = _load_sd(cf_ckpt_path)
+        _sd = _ckpt["generator_ema"]
+        # Remove 'model.' prefix like WanDiffusionWrapper does
+        if all(k.startswith("model.") for k in _sd.keys()):
+            _sd = {k.replace("model.", "", 1): v for k, v in _sd.items()}
+        _ckpt_keys = set(_sd.keys())
+        _model_keys = set(dict(generator.model.named_parameters()).keys())
+        _model_keys |= set(dict(generator.model.named_buffers()).keys())
+        _matched = _ckpt_keys & _model_keys
+        _ckpt_only = _ckpt_keys - _model_keys
+        _model_only = _model_keys - _ckpt_keys
+        print(f"[CF DEBUG] Checkpoint keys: {len(_ckpt_keys)}, Model keys: {len(_model_keys)}")
+        print(f"[CF DEBUG] Matched: {len(_matched)}, Ckpt-only: {len(_ckpt_only)}, Model-only: {len(_model_only)}")
+        if _ckpt_only:
+            _sample = sorted(_ckpt_only)[:10]
+            print(f"[CF DEBUG] Sample ckpt-only keys: {_sample}")
+        if _model_only:
+            _sample = sorted(_model_only)[:10]
+            print(f"[CF DEBUG] Sample model-only keys: {_sample}")
+        del _ckpt, _sd
 
         # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
         text_encoder_path = str(
