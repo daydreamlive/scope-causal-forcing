@@ -290,8 +290,9 @@ class CausalForcingPipeline(Pipeline):
     def _denoise_block(self, num_frames: int) -> torch.Tensor:
         """Run the spatial denoising loop with Classifier-Free Guidance.
 
-        Runs the generator twice per step (positive + negative prompt) and
-        combines predictions using the CFG formula.
+        Uses deterministic Euler ODE steps (matching the reference implementation)
+        instead of stochastic re-noising. Runs the generator twice per step
+        (positive + negative prompt) and combines using the CFG formula.
 
         Args:
             num_frames: Number of latent frames to generate in this block.
@@ -299,14 +300,14 @@ class CausalForcingPipeline(Pipeline):
         Returns:
             Denoised latent prediction [B, F, C, H_lat, W_lat]
         """
-        noisy_input = torch.randn(
+        sample = torch.randn(
             [1, num_frames, 16, self.height_latent, self.width_latent],
             device=self.device,
             dtype=self.dtype,
         )
 
         current_start = self.current_start_frame * self.frame_seq_length
-        denoised_pred = None
+        num_steps = len(self.denoising_step_list)
 
         for i, current_timestep in enumerate(self.denoising_step_list):
             timestep = (
@@ -320,7 +321,7 @@ class CausalForcingPipeline(Pipeline):
 
             # Conditional (positive prompt) forward pass
             flow_pred_cond, _ = self.generator(
-                noisy_image_or_video=noisy_input,
+                noisy_image_or_video=sample,
                 conditional_dict=self.conditional_dict,
                 timestep=timestep,
                 kv_cache=self.kv_cache_pos,
@@ -330,7 +331,7 @@ class CausalForcingPipeline(Pipeline):
 
             # Unconditional (negative prompt) forward pass
             flow_pred_uncond, _ = self.generator(
-                noisy_image_or_video=noisy_input,
+                noisy_image_or_video=sample,
                 conditional_dict=self.unconditional_dict,
                 timestep=timestep,
                 kv_cache=self.kv_cache_neg,
@@ -343,28 +344,20 @@ class CausalForcingPipeline(Pipeline):
                 flow_pred_cond - flow_pred_uncond
             )
 
-            # Convert combined flow prediction to x0
-            denoised_pred = self.generator._convert_flow_pred_to_x0(
-                flow_pred=flow_pred.flatten(0, 1),
-                xt=noisy_input.flatten(0, 1),
-                timestep=timestep.flatten(0, 1),
-            ).unflatten(0, flow_pred.shape[:2])
+            # Euler ODE step: sample = sample + flow * (sigma_next - sigma_curr)
+            # sigma = timestep / num_train_timesteps (from scheduler definition)
+            sigma_curr = current_timestep.float() / self.scheduler.num_train_timesteps
+            if i < num_steps - 1:
+                sigma_next = (
+                    self.denoising_step_list[i + 1].float()
+                    / self.scheduler.num_train_timesteps
+                )
+            else:
+                sigma_next = 0.0  # Final step goes to clean sample
 
-            # Re-noise for next step (except at the final step)
-            if i < len(self.denoising_step_list) - 1:
-                next_timestep = self.denoising_step_list[i + 1]
-                noisy_input = self.scheduler.add_noise(
-                    denoised_pred.flatten(0, 1),
-                    torch.randn_like(denoised_pred.flatten(0, 1)),
-                    next_timestep
-                    * torch.ones(
-                        [num_frames],
-                        device=self.device,
-                        dtype=torch.long,
-                    ),
-                ).unflatten(0, denoised_pred.shape[:2])
+            sample = sample + flow_pred * (sigma_next - sigma_curr)
 
-        return denoised_pred
+        return sample
 
     def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int):
         """Re-run generator at timestep=0 to write clean context into both KV caches.
