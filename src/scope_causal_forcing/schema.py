@@ -81,11 +81,18 @@ class CausalForcingConfig(BasePipelineConfig):
             order=4, component="cache", is_load_param=True
         ),
     )
+    guidance_scale: float = Field(
+        default=6.0,
+        ge=1.0,
+        le=20.0,
+        description="Classifier-Free Guidance scale. Higher values produce more prompt-adherent but less diverse output.",
+        json_schema_extra=ui_field_config(order=5, label="CFG Scale"),
+    )
     denoising_steps: list[int] = Field(
         default=[1000, 750, 500, 250],
         description="Denoising step schedule for progressive generation",
         json_schema_extra=ui_field_config(
-            order=5, component="denoising_steps", is_load_param=True
+            order=6, component="denoising_steps", is_load_param=True
         ),
     )
     quantization: None = Field(
