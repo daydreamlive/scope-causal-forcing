@@ -112,31 +112,18 @@ class CausalForcingPipeline(Pipeline):
             sink_size=0,
             local_attn_size=LOCAL_ATTN_SIZE,
         )
+        # Fix: WanDiffusionWrapper only strips 'model.' prefix, but the Causal Forcing
+        # checkpoint has '_fsdp_wrapped_module.' prefix from FSDP training. Reload manually.
+        from scope.core.pipelines.utils import load_state_dict as _load_sd
+        _sd = _load_sd(cf_ckpt_path)["generator_ema"]
+        _sd = {k.removeprefix("_fsdp_wrapped_module."): v for k, v in _sd.items()}
+        _result = generator.model.load_state_dict(_sd, assign=True, strict=False)
+        print(f"Reloaded weights: {len(_sd) - len(_result.unexpected_keys)} matched, "
+              f"{len(_result.missing_keys)} missing, {len(_result.unexpected_keys)} unexpected")
+        del _sd
+
         generator = generator.to(device=device, dtype=dtype)
         print(f"Loaded Causal Forcing generator in {time.time() - start:.3f}s")
-
-        # Diagnose weight loading: compare checkpoint keys vs model parameter names
-        from scope.core.pipelines.utils import load_state_dict as _load_sd
-        _ckpt = _load_sd(cf_ckpt_path)
-        _sd = _ckpt["generator_ema"]
-        # Remove 'model.' prefix like WanDiffusionWrapper does
-        if all(k.startswith("model.") for k in _sd.keys()):
-            _sd = {k.replace("model.", "", 1): v for k, v in _sd.items()}
-        _ckpt_keys = set(_sd.keys())
-        _model_keys = set(dict(generator.model.named_parameters()).keys())
-        _model_keys |= set(dict(generator.model.named_buffers()).keys())
-        _matched = _ckpt_keys & _model_keys
-        _ckpt_only = _ckpt_keys - _model_keys
-        _model_only = _model_keys - _ckpt_keys
-        print(f"[CF DEBUG] Checkpoint keys: {len(_ckpt_keys)}, Model keys: {len(_model_keys)}")
-        print(f"[CF DEBUG] Matched: {len(_matched)}, Ckpt-only: {len(_ckpt_only)}, Model-only: {len(_model_only)}")
-        if _ckpt_only:
-            _sample = sorted(_ckpt_only)[:10]
-            print(f"[CF DEBUG] Sample ckpt-only keys: {_sample}")
-        if _model_only:
-            _sample = sorted(_model_only)[:10]
-            print(f"[CF DEBUG] Sample model-only keys: {_sample}")
-        del _ckpt, _sd
 
         # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
         text_encoder_path = str(
@@ -178,10 +165,7 @@ class CausalForcingPipeline(Pipeline):
             torch.tensor([0.0], dtype=torch.float32),
         ])
         self.denoising_step_list = scheduler_timesteps[1000 - raw_steps]
-        print(f"[CF DEBUG] Raw denoising steps: {config.denoising_steps}")
-        print(f"[CF DEBUG] Warped denoising steps: {self.denoising_step_list.tolist()}")
-        print(f"[CF DEBUG] Scheduler timesteps range: [{self.scheduler.timesteps[0]:.2f}, {self.scheduler.timesteps[-1]:.2f}], len={len(self.scheduler.timesteps)}")
-        print(f"[CF DEBUG] Scheduler sigmas range: [{self.scheduler.sigmas[0]:.6f}, {self.scheduler.sigmas[-1]:.6f}]")
+        print(f"Warped denoising steps: {self.denoising_step_list.tolist()}")
 
         # Store components
         self.generator = generator
@@ -297,12 +281,8 @@ class CausalForcingPipeline(Pipeline):
 
         # Decode latent to pixel space
         video = self.vae.decode_to_pixel(denoised, use_cache=True)
-        print(f"[CF DEBUG] VAE output: shape={list(video.shape)}, min={video.min().item():.4f}, max={video.max().item():.4f}, mean={video.mean().item():.4f}")
 
-        result = postprocess_chunk(video)
-        print(f"[CF DEBUG] postprocess: shape={list(result.shape)}, min={result.min().item():.4f}, max={result.max().item():.4f}, mean={result.mean().item():.4f}")
-
-        return {"video": result}
+        return {"video": postprocess_chunk(video)}
 
     def _denoise_block(self, num_frames: int) -> torch.Tensor:
         """Run the spatial denoising loop.
@@ -326,9 +306,6 @@ class CausalForcingPipeline(Pipeline):
         current_start = self.current_start_frame * self.frame_seq_length
         num_steps = len(self.denoising_step_list)
 
-        print(f"[CF DEBUG] _denoise_block: num_frames={num_frames}, current_start_frame={self.current_start_frame}, current_start={current_start}")
-        print(f"[CF DEBUG] Initial noise: shape={list(sample.shape)}, min={sample.min().item():.4f}, max={sample.max().item():.4f}, mean={sample.mean().item():.4f}")
-
         for i, current_timestep in enumerate(self.denoising_step_list):
             timestep = (
                 torch.ones(
@@ -339,10 +316,8 @@ class CausalForcingPipeline(Pipeline):
                 * current_timestep
             )
 
-            print(f"[CF DEBUG] Step {i}: timestep={current_timestep.item():.2f}, timestep_tensor dtype={timestep.dtype}, sample dtype={sample.dtype}")
-
             if i < num_steps - 1:
-                flow_pred, pred_x0 = self.generator(
+                _, pred_x0 = self.generator(
                     noisy_image_or_video=sample,
                     conditional_dict=self.conditional_dict,
                     timestep=timestep,
@@ -350,29 +325,23 @@ class CausalForcingPipeline(Pipeline):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start,
                 )
-
-                print(f"[CF DEBUG]   flow_pred: min={flow_pred.min().item():.4f}, max={flow_pred.max().item():.4f}, mean={flow_pred.mean().item():.4f}, has_nan={flow_pred.isnan().any().item()}")
-                print(f"[CF DEBUG]   pred_x0:   min={pred_x0.min().item():.4f}, max={pred_x0.max().item():.4f}, mean={pred_x0.mean().item():.4f}, has_nan={pred_x0.isnan().any().item()}")
 
                 # Stochastic re-noising to next timestep level
                 next_timestep = self.denoising_step_list[i + 1]
                 flat_x0 = pred_x0.flatten(0, 1)
-                noise_for_renoise = torch.randn_like(flat_x0)
-                t_for_noise = next_timestep * torch.ones(
-                    [flat_x0.shape[0]],
-                    device=flat_x0.device,
-                    dtype=torch.long,
-                )
-                print(f"[CF DEBUG]   add_noise: next_t={next_timestep.item():.2f}, t_tensor dtype={t_for_noise.dtype}, t_values={t_for_noise.tolist()}")
                 sample = self.scheduler.add_noise(
                     flat_x0,
-                    noise_for_renoise,
-                    t_for_noise,
+                    torch.randn_like(flat_x0),
+                    next_timestep
+                    * torch.ones(
+                        [flat_x0.shape[0]],
+                        device=flat_x0.device,
+                        dtype=torch.long,
+                    ),
                 ).unflatten(0, pred_x0.shape[:2])
-                print(f"[CF DEBUG]   re-noised: min={sample.min().item():.4f}, max={sample.max().item():.4f}, mean={sample.mean().item():.4f}")
             else:
                 # Last step: output pred_x0 directly
-                flow_pred, pred_x0 = self.generator(
+                _, pred_x0 = self.generator(
                     noisy_image_or_video=sample,
                     conditional_dict=self.conditional_dict,
                     timestep=timestep,
@@ -380,11 +349,8 @@ class CausalForcingPipeline(Pipeline):
                     crossattn_cache=self.crossattn_cache,
                     current_start=current_start,
                 )
-                print(f"[CF DEBUG]   flow_pred: min={flow_pred.min().item():.4f}, max={flow_pred.max().item():.4f}, mean={flow_pred.mean().item():.4f}, has_nan={flow_pred.isnan().any().item()}")
-                print(f"[CF DEBUG]   pred_x0:   min={pred_x0.min().item():.4f}, max={pred_x0.max().item():.4f}, mean={pred_x0.mean().item():.4f}, has_nan={pred_x0.isnan().any().item()}")
                 sample = pred_x0
 
-        print(f"[CF DEBUG] Final denoised: min={sample.min().item():.4f}, max={sample.max().item():.4f}, mean={sample.mean().item():.4f}")
         return sample
 
     def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int):
