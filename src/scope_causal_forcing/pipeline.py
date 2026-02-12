@@ -117,6 +117,11 @@ class CausalForcingPipeline(Pipeline):
         from scope.core.pipelines.utils import load_state_dict as _load_sd
         _sd = _load_sd(cf_ckpt_path)["generator_ema"]
         _sd = {k.removeprefix("_fsdp_wrapped_module."): v for k, v in _sd.items()}
+        # Debug: compare actual keys
+        _sd_keys = sorted(_sd.keys())[:5]
+        _model_keys = sorted(generator.model.state_dict().keys())[:5]
+        print(f"[CF DEBUG] SD keys after strip: {_sd_keys}")
+        print(f"[CF DEBUG] Model state_dict keys: {_model_keys}")
         _result = generator.model.load_state_dict(_sd, assign=True, strict=False)
         print(f"Reloaded weights: {len(_sd) - len(_result.unexpected_keys)} matched, "
               f"{len(_result.missing_keys)} missing, {len(_result.unexpected_keys)} unexpected")
