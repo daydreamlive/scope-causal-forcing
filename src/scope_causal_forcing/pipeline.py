@@ -15,6 +15,8 @@ from typing import TYPE_CHECKING
 import torch
 
 from scope.core.config import get_model_file_path
+from scope.core.pipelines.blending import EmbeddingBlender, parse_transition_config
+from scope.core.pipelines.enums import Quantization
 from scope.core.pipelines.interface import Pipeline
 from scope.core.pipelines.process import postprocess_chunk
 from scope.core.pipelines.utils import validate_resolution
@@ -82,6 +84,7 @@ class CausalForcingPipeline(Pipeline):
 
     def __init__(
         self,
+        quantization: Quantization | None = None,
         device: torch.device | None = None,
         dtype: torch.dtype = torch.bfloat16,
         **kwargs,
@@ -134,7 +137,22 @@ class CausalForcingPipeline(Pipeline):
         )
         del _sd
 
-        generator = generator.to(device=device, dtype=dtype)
+        if quantization == Quantization.FP8_E4M3FN:
+            generator = generator.to(dtype=dtype)
+            start_q = time.time()
+            from torchao.quantization.quant_api import (
+                Float8DynamicActivationFloat8WeightConfig,
+                PerTensor,
+                quantize_,
+            )
+            quantize_(
+                generator,
+                Float8DynamicActivationFloat8WeightConfig(granularity=PerTensor()),
+                device=device,
+            )
+            logger.info("Quantized generator to FP8 in %.3fs", time.time() - start_q)
+        else:
+            generator = generator.to(device=device, dtype=dtype)
         logger.info("Loaded Causal Forcing generator in %.3fs", time.time() - start)
 
         # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
@@ -203,7 +221,7 @@ class CausalForcingPipeline(Pipeline):
         # Sets frame_seq_length and max_attention_size on all submodules so attention
         # windows and KV cache rolling work correctly.
         for block in self.generator.model.blocks:
-            block.self_attn.local_attn_size = -1
+            block.self_attn.local_attn_size = LOCAL_ATTN_SIZE
             block.self_attn.num_frame_per_block = self.num_frame_per_block
         self.generator.model.local_attn_size = LOCAL_ATTN_SIZE
         set_all_modules_frame_seq_length(self.generator, self.frame_seq_length)
@@ -211,12 +229,15 @@ class CausalForcingPipeline(Pipeline):
             self.generator, LOCAL_ATTN_SIZE * self.frame_seq_length
         )
 
+        # Embedding blender for smooth prompt transitions
+        self.blender = EmbeddingBlender(device=device, dtype=dtype)
+
         # Streaming state - single KV cache (no CFG for DMD checkpoint)
         self.kv_cache = None
         self.crossattn_cache = None
         self.current_start_frame = 0
-        self.conditional_dict = None
-        self._current_prompt = None
+        self._conditioning_embeds = None
+        self._last_prompts_signature = None
 
     def _resolve_checkpoint_path(self, config) -> str:
         """Resolve the path to the Causal Forcing checkpoint file."""
@@ -264,11 +285,106 @@ class CausalForcingPipeline(Pipeline):
         if hasattr(self.vae, "model") and hasattr(self.vae.model, "clear_cache"):
             self.vae.model.clear_cache()
 
+        self.blender.reset()
+        self._conditioning_embeds = None
+        self._last_prompts_signature = None
         self.current_start_frame = 0
+
+    @staticmethod
+    def _normalize_prompts(prompts) -> list[dict]:
+        """Normalize prompts to list[dict] format with text and weight."""
+        if not prompts:
+            return []
+        if isinstance(prompts, str):
+            return [{"text": prompts, "weight": 1.0}]
+        result = []
+        for p in prompts:
+            if isinstance(p, str):
+                result.append({"text": p, "weight": 1.0})
+            elif isinstance(p, dict):
+                result.append({"text": p.get("text", ""), "weight": p.get("weight", 1.0)})
+            else:
+                result.append({"text": str(p), "weight": 1.0})
+        return result
+
+    def _update_conditioning(self, prompts, transition) -> bool:
+        """Handle prompt encoding and embedding blending.
+
+        Returns True if conditioning embeddings were updated (cross-attn cache
+        needs re-initialization).
+        """
+        prompt_items = self._normalize_prompts(prompts)
+        if not prompt_items:
+            if self._conditioning_embeds is None:
+                cond = self.text_encoder(text_prompts=[""])
+                self._conditioning_embeds = cond["prompt_embeds"]
+                return True
+            return False
+
+        # Detect changes via signature (text + weight tuples)
+        current_signature = tuple((p["text"], p["weight"]) for p in prompt_items)
+        conditioning_changed = current_signature != self._last_prompts_signature
+        self._last_prompts_signature = current_signature
+
+        embeds_updated = False
+
+        if conditioning_changed:
+            # Cancel active transition on new prompt change
+            if self.blender.is_transitioning():
+                self.blender.cancel_transition()
+
+            # Encode all prompt texts
+            texts = [item["text"] for item in prompt_items]
+            weights = [item["weight"] for item in prompt_items]
+            cond = self.text_encoder(text_prompts=texts)
+            batched_embeds = cond["prompt_embeds"]
+            embeds_list = [batched_embeds[i : i + 1] for i in range(batched_embeds.shape[0])]
+
+            # Spatial blend to get target embedding
+            target_blend = self.blender.blend(
+                embeddings=embeds_list,
+                weights=weights,
+                interpolation_method="linear",
+                cache_result=False,
+            )
+
+            # Apply with or without temporal transition
+            tc = parse_transition_config(transition)
+            if tc.num_steps > 0 and self._conditioning_embeds is not None:
+                # Smooth transition from current to target over N frames
+                self.blender.start_transition(
+                    source_embedding=self._conditioning_embeds,
+                    target_embedding=target_blend,
+                    num_steps=tc.num_steps,
+                    temporal_interpolation_method=tc.temporal_interpolation_method,
+                )
+                next_emb = self.blender.get_next_embedding()
+                if next_emb is not None:
+                    self._conditioning_embeds = next_emb.to(dtype=self.dtype)
+                    embeds_updated = True
+            else:
+                # Immediate snap to new embedding
+                self._conditioning_embeds = target_blend.to(dtype=self.dtype)
+                embeds_updated = True
+
+        elif self.blender.is_transitioning():
+            # Continue active transition (no new prompt change this frame)
+            next_emb = self.blender.get_next_embedding()
+            if next_emb is not None:
+                self._conditioning_embeds = next_emb.to(dtype=self.dtype)
+                embeds_updated = True
+
+        if self._conditioning_embeds is None:
+            cond = self.text_encoder(text_prompts=[""])
+            self._conditioning_embeds = cond["prompt_embeds"]
+            embeds_updated = True
+
+        return embeds_updated
 
     def __call__(self, **kwargs) -> dict:
         init_cache = kwargs.get("init_cache", False)
         prompts = kwargs.get("prompts")
+        transition = kwargs.get("transition")
 
         # Initialize or reset caches
         if self.kv_cache is None:
@@ -284,33 +400,26 @@ class CausalForcingPipeline(Pipeline):
             )
             self._reset_caches()
 
-        # Handle prompt changes: re-encode text and reset cross-attention cache
-        if prompts and len(prompts) > 0:
-            first_prompt = prompts[0]
-            new_prompt = (
-                first_prompt["text"]
-                if isinstance(first_prompt, dict)
-                else first_prompt
-            )
-            if new_prompt != self._current_prompt:
-                self.conditional_dict = self.text_encoder(text_prompts=[new_prompt])
-                self._current_prompt = new_prompt
-                # Reset cross-attention cache so it recomputes from new prompt embeddings
-                if self.crossattn_cache is not None:
-                    for entry in self.crossattn_cache:
-                        entry["is_init"] = False
+        # Handle prompt encoding, spatial blending, and temporal transitions
+        embeds_updated = self._update_conditioning(prompts, transition)
 
-        if self.conditional_dict is None:
-            self.conditional_dict = self.text_encoder(text_prompts=[""])
+        # Reset cross-attention cache when embeddings change so it recomputes
+        # from the new prompt embedding. KV cache (self-attention context) is
+        # preserved for temporal coherence.
+        if embeds_updated and self.crossattn_cache is not None:
+            for entry in self.crossattn_cache:
+                entry["is_init"] = False
+
+        conditional_dict = {"prompt_embeds": self._conditioning_embeds}
 
         # WanVAE stream_decode requires >= 2 latent frames on the first batch
         num_frames = 2 if self.current_start_frame == 0 else self.num_frame_per_block
 
         # Generate block of frames
-        denoised = self._denoise_block(num_frames)
+        denoised = self._denoise_block(num_frames, conditional_dict)
 
         # Update KV cache with clean context (timestep=0)
-        self._cache_clean_context(denoised, num_frames)
+        self._cache_clean_context(denoised, num_frames, conditional_dict)
 
         # Advance frame pointer
         self.current_start_frame += num_frames
@@ -320,7 +429,7 @@ class CausalForcingPipeline(Pipeline):
 
         return {"video": postprocess_chunk(video)}
 
-    def _denoise_block(self, num_frames: int) -> torch.Tensor:
+    def _denoise_block(self, num_frames: int, conditional_dict: dict) -> torch.Tensor:
         """Run the spatial denoising loop.
 
         Uses pred_x0 + stochastic re-noising matching the reference
@@ -329,6 +438,7 @@ class CausalForcingPipeline(Pipeline):
 
         Args:
             num_frames: Number of latent frames to generate in this block.
+            conditional_dict: Text conditioning embeddings.
 
         Returns:
             Denoised latent prediction [B, F, C, H_lat, W_lat]
@@ -355,7 +465,7 @@ class CausalForcingPipeline(Pipeline):
             if i < num_steps - 1:
                 _, pred_x0 = self.generator(
                     noisy_image_or_video=sample,
-                    conditional_dict=self.conditional_dict,
+                    conditional_dict=conditional_dict,
                     timestep=timestep,
                     kv_cache=self.kv_cache,
                     crossattn_cache=self.crossattn_cache,
@@ -379,7 +489,7 @@ class CausalForcingPipeline(Pipeline):
                 # Last step: output pred_x0 directly
                 _, pred_x0 = self.generator(
                     noisy_image_or_video=sample,
-                    conditional_dict=self.conditional_dict,
+                    conditional_dict=conditional_dict,
                     timestep=timestep,
                     kv_cache=self.kv_cache,
                     crossattn_cache=self.crossattn_cache,
@@ -389,7 +499,7 @@ class CausalForcingPipeline(Pipeline):
 
         return sample
 
-    def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int):
+    def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int, conditional_dict: dict):
         """Re-run generator at timestep=0 to write clean context into KV cache."""
         context_timestep = torch.zeros(
             [1, num_frames],
@@ -400,7 +510,7 @@ class CausalForcingPipeline(Pipeline):
 
         self.generator(
             noisy_image_or_video=denoised,
-            conditional_dict=self.conditional_dict,
+            conditional_dict=conditional_dict,
             timestep=context_timestep,
             kv_cache=self.kv_cache,
             crossattn_cache=self.crossattn_cache,

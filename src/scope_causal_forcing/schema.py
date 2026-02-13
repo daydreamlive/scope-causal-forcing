@@ -13,6 +13,7 @@ from scope.core.pipelines.common_artifacts import (
     UMT5_ENCODER_ARTIFACT,
     WAN_1_3B_ARTIFACT,
 )
+from scope.core.pipelines.enums import Quantization
 from scope.core.pipelines.utils import VaeType
 
 
@@ -88,7 +89,7 @@ class CausalForcingConfig(BasePipelineConfig):
             order=6, component="denoising_steps", is_load_param=True
         ),
     )
-    quantization: None = Field(
+    quantization: Quantization | None = Field(
         default=None,
         description="Quantization method for the diffusion model.",
         json_schema_extra=ui_field_config(
