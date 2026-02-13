@@ -76,11 +76,6 @@ LOCAL_ATTN_SIZE = 21
 # When current_start_frame reaches this limit, caches must be reset.
 MAX_ROPE_SEQ_LEN = 1024
 
-# Periodic KV cache refresh interval (in frames).
-# Re-encodes the latent buffer to scrub accumulated autoregressive drift
-# from the KV cache features.  200 frames ≈ 13s @ 15 fps, ~5 % overhead.
-CACHE_REFRESH_INTERVAL = 200
-
 
 class CausalForcingPipeline(Pipeline):
     @classmethod
@@ -245,12 +240,9 @@ class CausalForcingPipeline(Pipeline):
         self._last_prompts_signature = None
 
         # Recache buffer: sliding window of denoised latents for temporal continuity
-        # across RoPE boundaries and prompt changes (inspired by LongLive's
-        # RecacheFramesBlock + PrepareRecacheFramesBlock).
+        # across RoPE boundaries (inspired by LongLive's RecacheFramesBlock).
         self._recache_buffer = None
         self._recache_buffer_count = 0
-        self._frames_since_recache = 0
-        self._refresh_cursor = -1  # -1 = idle, 0..N = amortized refresh in progress
 
     def _resolve_checkpoint_path(self, config) -> str:
         """Resolve the path to the Causal Forcing checkpoint file."""
@@ -329,8 +321,6 @@ class CausalForcingPipeline(Pipeline):
         self._conditioning_embeds = None
         self._last_prompts_signature = None
         self.current_start_frame = 0
-        self._frames_since_recache = 0
-        self._refresh_cursor = -1
         self._init_recache_buffer()
 
     @staticmethod
@@ -441,14 +431,8 @@ class CausalForcingPipeline(Pipeline):
         conditional_dict = {"prompt_embeds": self._conditioning_embeds}
 
         # --- Recaching logic ---
-        # Determines whether we need to re-encode the latent buffer through the
-        # generator to rebuild the KV cache.  Two triggers:
-        #   A) RoPE boundary: remap buffer to position 0 (smooth reset)
-        #   B) Prompt change: re-encode buffer with new conditioning
-        needs_recache = False
-        recache_start = 0
-
-        # Case A: RoPE frequency table boundary → smooth reset
+        # RoPE frequency table boundary → smooth reset.
+        # Re-encode the latent buffer at position 0 to maintain temporal context.
         if self.current_start_frame >= MAX_ROPE_SEQ_LEN - self.num_frame_per_block:
             logger.info(
                 "RoPE boundary at frame %d, smooth reset via recache",
@@ -461,55 +445,15 @@ class CausalForcingPipeline(Pipeline):
             self.crossattn_cache = self._make_crossattn_cache(
                 existing=self.crossattn_cache
             )
-            recache_start = 0
             self.current_start_frame = 0
-            needs_recache = True
+            if self._recache_buffer_count > 0:
+                self._recache_from_buffer(0, conditional_dict)
+                self.current_start_frame = self._recache_buffer_count
 
-        # Case B: Conditioning changed → rebuild KV cache at current positions
-        elif (
-            embeds_updated
-            and self.crossattn_cache is not None
-            and self.current_start_frame > 0
-        ):
-            n = self._recache_buffer_count
-            # Reset cross-attention cache so it recomputes with new embeddings
-            for entry in self.crossattn_cache:
-                entry["is_init"] = False
-            # Reset KV cache indices (temporal features will be re-written by recache)
-            self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
-            recache_start = max(0, self.current_start_frame - n)
-            self.current_start_frame = recache_start
-            needs_recache = True
-
-        # Case C: Start periodic amortized refresh when interval is reached
-        elif (
-            self._refresh_cursor < 0
-            and self._frames_since_recache >= CACHE_REFRESH_INTERVAL
-            and self._recache_buffer_count > 0
-        ):
-            logger.debug(
-                "Starting amortized cache refresh at frame %d",
-                self.current_start_frame,
-            )
-            self._refresh_cursor = 0
-
-        # Case D: Embeddings changed but no frames generated yet → just reset cross-attn
+        # Reset cross-attn cache when conditioning changes so it recomputes
         elif embeds_updated and self.crossattn_cache is not None:
             for entry in self.crossattn_cache:
                 entry["is_init"] = False
-
-        # Execute bulk recache (for RoPE / prompt-change cases)
-        if needs_recache and self._recache_buffer_count > 0:
-            self._recache_from_buffer(recache_start, conditional_dict)
-            self.current_start_frame = recache_start + self._recache_buffer_count
-            self._frames_since_recache = 0
-            self._refresh_cursor = -1  # cancel any in-flight amortized refresh
-
-        # Amortized refresh: re-encode ONE buffer frame per generation call.
-        # Uses is_recompute to overwrite stale KV cache entries in-place
-        # without resetting indices — no stutter, no quality dip.
-        if self._refresh_cursor >= 0 and not needs_recache:
-            self._amortized_refresh_step(conditional_dict)
 
         # --- Normal generation (unchanged) ---
         # WanVAE stream_decode requires >= 2 latent frames on the first batch
@@ -524,9 +468,8 @@ class CausalForcingPipeline(Pipeline):
         # Advance frame pointer
         self.current_start_frame += num_frames
 
-        # Update recache buffer and refresh counter
+        # Update recache buffer
         self._update_recache_buffer(denoised)
-        self._frames_since_recache += num_frames
 
         # Decode latent to pixel space
         video = self.vae.decode_to_pixel(denoised, use_cache=True)
@@ -603,44 +546,6 @@ class CausalForcingPipeline(Pipeline):
 
         return sample
 
-    def _amortized_refresh_step(self, conditional_dict: dict):
-        """Re-encode one buffer frame per call to gradually refresh the KV cache.
-
-        Because the re-encoded positions are behind ``global_end_index``, the
-        CausalWanModel's ``is_recompute`` logic overwrites the stale KV entries
-        in-place without advancing any cache pointers.  This means:
-          - No KV cache reset needed
-          - No ``current_start_frame`` change
-          - No quality dip (full 21-frame context always available)
-          - Cost: one extra forward pass per frame (~35 ms) for 21 frames
-        """
-        n = self._recache_buffer_count
-        idx = self._refresh_cursor
-        if idx >= n:
-            # Refresh complete
-            self._refresh_cursor = -1
-            self._frames_since_recache = 0
-            logger.debug("Amortized cache refresh complete")
-            return
-
-        recache_base = self.current_start_frame - n
-        frame = self._recache_buffer[:, -(n - idx) : -(n - idx) + 1].contiguous()
-        ts = torch.zeros([1, 1], device=self.device, dtype=torch.int64)
-        self.generator(
-            noisy_image_or_video=frame,
-            conditional_dict=conditional_dict,
-            timestep=ts,
-            kv_cache=self.kv_cache,
-            crossattn_cache=self.crossattn_cache,
-            current_start=(recache_base + idx) * self.frame_seq_length,
-        )
-        self._refresh_cursor += 1
-
-        if self._refresh_cursor >= n:
-            self._refresh_cursor = -1
-            self._frames_since_recache = 0
-            logger.debug("Amortized cache refresh complete")
-
     def _recache_from_buffer(self, recache_start: int, conditional_dict: dict):
         """Re-encode buffered latents through the generator to rebuild the KV cache.
 
@@ -648,10 +553,11 @@ class CausalForcingPipeline(Pipeline):
         single-frame attention path without needing block-mask reconfiguration.
         This mirrors LongLive's ``RecacheFramesBlock`` but in a simpler loop.
 
+        Used at RoPE boundaries to remap the recent context window to position 0,
+        preserving temporal continuity across the reset.
+
         Args:
-            recache_start: Frame index at which to start writing into the
-                KV cache (0 for RoPE boundary resets, ``current_start_frame -
-                buffer_count`` for prompt-change recaching).
+            recache_start: Frame index at which to start writing into the KV cache.
             conditional_dict: Current text conditioning embeddings.
         """
         n = self._recache_buffer_count
