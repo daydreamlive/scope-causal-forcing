@@ -239,6 +239,12 @@ class CausalForcingPipeline(Pipeline):
         self._conditioning_embeds = None
         self._last_prompts_signature = None
 
+        # Recache buffer: sliding window of denoised latents for temporal continuity
+        # across RoPE boundaries and prompt changes (inspired by LongLive's
+        # RecacheFramesBlock + PrepareRecacheFramesBlock).
+        self._recache_buffer = None
+        self._recache_buffer_count = 0
+
     def _resolve_checkpoint_path(self, config) -> str:
         """Resolve the path to the Causal Forcing checkpoint file."""
         generator_path = getattr(config, "generator_path", None)
@@ -274,6 +280,33 @@ class CausalForcingPipeline(Pipeline):
         self.crossattn_cache = self._make_crossattn_cache()
         self.current_start_frame = 0
 
+    def _init_recache_buffer(self):
+        """Initialize (or reinitialize) the sliding window latent buffer."""
+        self._recache_buffer = torch.zeros(
+            [1, LOCAL_ATTN_SIZE, 16, self.height_latent, self.width_latent],
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self._recache_buffer_count = 0
+
+    def _update_recache_buffer(self, denoised: torch.Tensor):
+        """Append denoised latent(s) to the sliding window buffer.
+
+        Mirrors LongLive's ``PrepareRecacheFramesBlock``: drops the oldest
+        frame(s) and appends the newly generated one(s).
+        """
+        num_new = denoised.shape[1]
+        self._recache_buffer = torch.cat(
+            [
+                self._recache_buffer[:, num_new:],
+                denoised.detach(),
+            ],
+            dim=1,
+        )
+        self._recache_buffer_count = min(
+            self._recache_buffer_count + num_new, LOCAL_ATTN_SIZE
+        )
+
     def _reset_caches(self):
         """Reset caches for a fresh generation sequence."""
         if self.kv_cache is not None:
@@ -289,6 +322,7 @@ class CausalForcingPipeline(Pipeline):
         self._conditioning_embeds = None
         self._last_prompts_signature = None
         self.current_start_frame = 0
+        self._init_recache_buffer()
 
     @staticmethod
     def _normalize_prompts(prompts) -> list[dict]:
@@ -386,32 +420,69 @@ class CausalForcingPipeline(Pipeline):
         prompts = kwargs.get("prompts")
         transition = kwargs.get("transition")
 
-        # Initialize or reset caches
+        # Initialize caches and recache buffer on first call
         if self.kv_cache is None:
             self._initialize_caches()
+            self._init_recache_buffer()
         elif init_cache:
-            self._reset_caches()
-
-        # Auto-reset when approaching RoPE frequency table boundary
-        if self.current_start_frame >= MAX_ROPE_SEQ_LEN - self.num_frame_per_block:
-            logger.info(
-                "RoPE boundary reached (frame %d), resetting caches",
-                self.current_start_frame,
-            )
             self._reset_caches()
 
         # Handle prompt encoding, spatial blending, and temporal transitions
         embeds_updated = self._update_conditioning(prompts, transition)
+        conditional_dict = {"prompt_embeds": self._conditioning_embeds}
 
-        # Reset cross-attention cache when embeddings change so it recomputes
-        # from the new prompt embedding. KV cache (self-attention context) is
-        # preserved for temporal coherence.
-        if embeds_updated and self.crossattn_cache is not None:
+        # --- Recaching logic ---
+        # Determines whether we need to re-encode the latent buffer through the
+        # generator to rebuild the KV cache.  Two triggers:
+        #   A) RoPE boundary: remap buffer to position 0 (smooth reset)
+        #   B) Prompt change: re-encode buffer with new conditioning
+        needs_recache = False
+        recache_start = 0
+
+        # Case A: RoPE frequency table boundary → smooth reset
+        if self.current_start_frame >= MAX_ROPE_SEQ_LEN - self.num_frame_per_block:
+            logger.info(
+                "RoPE boundary at frame %d, smooth reset via recache",
+                self.current_start_frame,
+            )
+            # Reset cache indices (reuse existing tensor allocations).
+            # VAE cache is NOT cleared — it tracks decoded frames independently
+            # of RoPE positions, so clearing it would cause a visual glitch.
+            self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
+            self.crossattn_cache = self._make_crossattn_cache(
+                existing=self.crossattn_cache
+            )
+            recache_start = 0
+            self.current_start_frame = 0
+            needs_recache = True
+
+        # Case B: Conditioning changed → rebuild KV cache at current positions
+        elif (
+            embeds_updated
+            and self.crossattn_cache is not None
+            and self.current_start_frame > 0
+        ):
+            n = self._recache_buffer_count
+            # Reset cross-attention cache so it recomputes with new embeddings
+            for entry in self.crossattn_cache:
+                entry["is_init"] = False
+            # Reset KV cache indices (temporal features will be re-written by recache)
+            self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
+            recache_start = max(0, self.current_start_frame - n)
+            self.current_start_frame = recache_start
+            needs_recache = True
+
+        # Case C: Embeddings changed but no frames generated yet → just reset cross-attn
+        elif embeds_updated and self.crossattn_cache is not None:
             for entry in self.crossattn_cache:
                 entry["is_init"] = False
 
-        conditional_dict = {"prompt_embeds": self._conditioning_embeds}
+        # Execute recache if needed
+        if needs_recache and self._recache_buffer_count > 0:
+            self._recache_from_buffer(recache_start, conditional_dict)
+            self.current_start_frame = recache_start + self._recache_buffer_count
 
+        # --- Normal generation (unchanged) ---
         # WanVAE stream_decode requires >= 2 latent frames on the first batch
         num_frames = 2 if self.current_start_frame == 0 else self.num_frame_per_block
 
@@ -423,6 +494,9 @@ class CausalForcingPipeline(Pipeline):
 
         # Advance frame pointer
         self.current_start_frame += num_frames
+
+        # Update recache buffer with newly generated latents
+        self._update_recache_buffer(denoised)
 
         # Decode latent to pixel space
         video = self.vae.decode_to_pixel(denoised, use_cache=True)
@@ -498,6 +572,41 @@ class CausalForcingPipeline(Pipeline):
                 sample = pred_x0
 
         return sample
+
+    def _recache_from_buffer(self, recache_start: int, conditional_dict: dict):
+        """Re-encode buffered latents through the generator to rebuild the KV cache.
+
+        Processes frames one-by-one (framewise) so we reuse the normal
+        single-frame attention path without needing block-mask reconfiguration.
+        This mirrors LongLive's ``RecacheFramesBlock`` but in a simpler loop.
+
+        Args:
+            recache_start: Frame index at which to start writing into the
+                KV cache (0 for RoPE boundary resets, ``current_start_frame -
+                buffer_count`` for prompt-change recaching).
+            conditional_dict: Current text conditioning embeddings.
+        """
+        n = self._recache_buffer_count
+        if n == 0:
+            return
+
+        frames = self._recache_buffer[:, -n:].contiguous()
+
+        for i in range(n):
+            frame = frames[:, i : i + 1]
+            ts = torch.zeros([1, 1], device=self.device, dtype=torch.int64)
+            self.generator(
+                noisy_image_or_video=frame,
+                conditional_dict=conditional_dict,
+                timestep=ts,
+                kv_cache=self.kv_cache,
+                crossattn_cache=self.crossattn_cache,
+                current_start=(recache_start + i) * self.frame_seq_length,
+            )
+
+        logger.info(
+            "Recached %d frames starting at position %d", n, recache_start
+        )
 
     def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int, conditional_dict: dict):
         """Re-run generator at timestep=0 to write clean context into KV cache."""
