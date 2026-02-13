@@ -363,6 +363,7 @@ class CausalForcingPipeline(Pipeline):
 
         return embeds_updated
 
+    @torch.no_grad()
     def __call__(self, **kwargs) -> dict:
         init_cache = kwargs.get("init_cache", False)
         prompts = kwargs.get("prompts")
