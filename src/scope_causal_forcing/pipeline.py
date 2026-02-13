@@ -455,18 +455,25 @@ class CausalForcingPipeline(Pipeline):
             for entry in self.crossattn_cache:
                 entry["is_init"] = False
 
-        # --- Normal generation (unchanged) ---
-        # WanVAE stream_decode requires >= 2 latent frames on the first batch
-        num_frames = 2 if self.current_start_frame == 0 else self.num_frame_per_block
+        # --- Generation ---
+        if self.current_start_frame == 0:
+            # First two frames: generate 1 frame at a time to match training
+            # (num_frame_per_block=1), then concatenate for VAE stream_decode
+            # which requires >= 2 latent frames on the first batch.
+            frame0 = self._denoise_block(1, conditional_dict)
+            self._cache_clean_context(frame0, 1, conditional_dict)
+            self.current_start_frame += 1
 
-        # Generate block of frames
-        denoised = self._denoise_block(num_frames, conditional_dict)
+            frame1 = self._denoise_block(1, conditional_dict)
+            self._cache_clean_context(frame1, 1, conditional_dict)
+            self.current_start_frame += 1
 
-        # Update KV cache with clean context (timestep=0)
-        self._cache_clean_context(denoised, num_frames, conditional_dict)
-
-        # Advance frame pointer
-        self.current_start_frame += num_frames
+            denoised = torch.cat([frame0, frame1], dim=1)
+        else:
+            # Normal single-frame generation
+            denoised = self._denoise_block(self.num_frame_per_block, conditional_dict)
+            self._cache_clean_context(denoised, self.num_frame_per_block, conditional_dict)
+            self.current_start_frame += self.num_frame_per_block
 
         # Update recache buffer
         self._update_recache_buffer(denoised)
