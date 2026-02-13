@@ -1,10 +1,6 @@
 """Causal Forcing pipeline for real-time streaming video generation.
 
 Adapted from https://github.com/thu-ml/Causal-Forcing
-Uses Scope's existing Wan2.1 infrastructure with Causal Forcing checkpoint weights.
-
-The DMD (Distribution Matching Distillation) checkpoint is designed for fast 4-step
-inference WITHOUT Classifier-Free Guidance, matching the reference causal_inference.py.
 """
 
 import logging
@@ -35,12 +31,7 @@ if TYPE_CHECKING:
 
 
 def _import_causal_wan_model():
-    """Import CausalWanModel from any available Wan2.1-based pipeline.
-
-    Multiple Scope pipelines bundle their own copy of CausalWanModel. We try
-    several in order of preference so the plugin is not tightly coupled to a
-    single built-in pipeline.
-    """
+    """Import CausalWanModel from any available Wan2.1-based pipeline."""
     sources = [
         "scope.core.pipelines.longlive.modules.causal_model",
         "scope.core.pipelines.streamdiffusionv2.modules.causal_model",
@@ -63,17 +54,10 @@ def _import_causal_wan_model():
 
 logger = logging.getLogger(__name__)
 
-# VAE and patch embedding downsample factors
 VAE_SPATIAL_DOWNSAMPLE = 8
 PATCH_SPATIAL_DOWNSAMPLE = 2
-TOTAL_SPATIAL_DOWNSAMPLE = VAE_SPATIAL_DOWNSAMPLE * PATCH_SPATIAL_DOWNSAMPLE  # 16
-
-# Rolling attention window size (in frames).
-# CausalWanModel requires local_attn_size != -1 for KV cache rolling eviction.
+TOTAL_SPATIAL_DOWNSAMPLE = VAE_SPATIAL_DOWNSAMPLE * PATCH_SPATIAL_DOWNSAMPLE
 LOCAL_ATTN_SIZE = 21
-
-# RoPE frequency table maximum sequence length (in frames).
-# When current_start_frame reaches this limit, caches must be reset.
 MAX_ROPE_SEQ_LEN = 1024
 
 
@@ -94,7 +78,6 @@ class CausalForcingPipeline(Pipeline):
         if device is None:
             device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Build config from kwargs (pipeline_manager passes config fields as kwargs)
         config = CausalForcingConfig(**kwargs)
 
         validate_resolution(
@@ -107,11 +90,8 @@ class CausalForcingPipeline(Pipeline):
         if model_dir is None:
             model_dir = str(get_model_file_path("Wan2.1-T2V-1.3B").parent)
 
-        # Resolve Causal Forcing checkpoint path
         cf_ckpt_path = self._resolve_checkpoint_path(config)
 
-        # Load generator: Wan2.1-1.3B base config + Causal Forcing weights
-        # Causal Forcing uses sink_size=0; local_attn_size enables rolling KV cache eviction
         start = time.time()
         generator = WanDiffusionWrapper(
             CausalWanModel,
@@ -123,8 +103,7 @@ class CausalForcingPipeline(Pipeline):
             sink_size=0,
             local_attn_size=LOCAL_ATTN_SIZE,
         )
-        # Fix: WanDiffusionWrapper only strips 'model.' prefix, but the Causal Forcing
-        # checkpoint has '_fsdp_wrapped_module.' prefix from FSDP training. Reload manually.
+        # Reload with double-prefix stripping (model. + _fsdp_wrapped_module.)
         from scope.core.pipelines.utils import load_state_dict as _load_sd
         _sd = _load_sd(cf_ckpt_path)["generator_ema"]
         _sd = {k.removeprefix("model.").removeprefix("_fsdp_wrapped_module."): v for k, v in _sd.items()}
@@ -155,7 +134,6 @@ class CausalForcingPipeline(Pipeline):
             generator = generator.to(device=device, dtype=dtype)
         logger.info("Loaded Causal Forcing generator in %.3fs", time.time() - start)
 
-        # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
         text_encoder_path = str(
             get_model_file_path("WanVideo_comfy/umt5-xxl-enc-fp8_e4m3fn.safetensors")
         )
@@ -172,7 +150,6 @@ class CausalForcingPipeline(Pipeline):
         text_encoder = text_encoder.to(device=device, dtype=torch.bfloat16)
         logger.info("Loaded text encoder in %.3fs", time.time() - start)
 
-        # Load VAE
         start = time.time()
         vae = create_vae(
             model_dir=model_dir,
@@ -182,13 +159,9 @@ class CausalForcingPipeline(Pipeline):
         vae = vae.to(device=device, dtype=dtype)
         logger.info("Loaded VAE (type=%s) in %.3fs", config.vae_type, time.time() - start)
 
-        # Setup scheduler
         self.scheduler = generator.get_scheduler()
 
-        # Warp denoising steps through the scheduler's shifted timestep table.
-        # This maps raw indices [1000, 750, 500, 250] to the actual shifted timestep
-        # values the model was trained with (e.g., [1000, 937.5, 833.3, 625.0]).
-        # Reference: Causal-Forcing/model/base.py lines 20-24
+        # Warp denoising steps through the scheduler's shifted timestep table
         raw_steps = torch.tensor(config.denoising_steps, dtype=torch.long)
         scheduler_timesteps = torch.cat([
             self.scheduler.timesteps.cpu(),
@@ -197,14 +170,12 @@ class CausalForcingPipeline(Pipeline):
         self.denoising_step_list = scheduler_timesteps[1000 - raw_steps]
         logger.info("Warped denoising steps: %s", self.denoising_step_list.tolist())
 
-        # Store components
         self.generator = generator
         self.text_encoder = text_encoder
         self.vae = vae
         self.device = device
         self.dtype = dtype
 
-        # Resolution-dependent constants
         self.height = config.height
         self.width = config.width
         self.height_latent = config.height // VAE_SPATIAL_DOWNSAMPLE
@@ -214,12 +185,8 @@ class CausalForcingPipeline(Pipeline):
             * (config.width // TOTAL_SPATIAL_DOWNSAMPLE)
         )
 
-        # Framewise generation (1 latent frame per block)
         self.num_frame_per_block = 1
 
-        # Configure transformer block attributes (matches SetupCachesBlock behavior).
-        # Sets frame_seq_length and max_attention_size on all submodules so attention
-        # windows and KV cache rolling work correctly.
         for block in self.generator.model.blocks:
             block.self_attn.local_attn_size = LOCAL_ATTN_SIZE
             block.self_attn.num_frame_per_block = self.num_frame_per_block
@@ -229,18 +196,16 @@ class CausalForcingPipeline(Pipeline):
             self.generator, LOCAL_ATTN_SIZE * self.frame_seq_length
         )
 
-        # Embedding blender for smooth prompt transitions
         self.blender = EmbeddingBlender(device=device, dtype=dtype)
+        self.base_seed = config.base_seed
+        self._rng = torch.Generator(device=device).manual_seed(self.base_seed)
 
-        # Streaming state - single KV cache (no CFG for DMD checkpoint)
         self.kv_cache = None
         self.crossattn_cache = None
         self.current_start_frame = 0
         self._conditioning_embeds = None
         self._last_prompts_signature = None
 
-        # Recache buffer: sliding window of denoised latents for temporal continuity
-        # across RoPE boundaries (inspired by LongLive's RecacheFramesBlock).
         self._recache_buffer = None
         self._recache_buffer_count = 0
 
@@ -289,11 +254,7 @@ class CausalForcingPipeline(Pipeline):
         self._recache_buffer_count = 0
 
     def _update_recache_buffer(self, denoised: torch.Tensor):
-        """Append denoised latent(s) to the sliding window buffer.
-
-        Mirrors LongLive's ``PrepareRecacheFramesBlock``: drops the oldest
-        frame(s) and appends the newly generated one(s).
-        """
+        """Append denoised latent(s) to the sliding window buffer."""
         num_new = denoised.shape[1]
         self._recache_buffer = torch.cat(
             [
@@ -321,11 +282,11 @@ class CausalForcingPipeline(Pipeline):
         self._conditioning_embeds = None
         self._last_prompts_signature = None
         self.current_start_frame = 0
+        self._rng = torch.Generator(device=self.device).manual_seed(self.base_seed)
         self._init_recache_buffer()
 
     @staticmethod
     def _normalize_prompts(prompts) -> list[dict]:
-        """Normalize prompts to list[dict] format with text and weight."""
         if not prompts:
             return []
         if isinstance(prompts, str):
@@ -341,11 +302,7 @@ class CausalForcingPipeline(Pipeline):
         return result
 
     def _update_conditioning(self, prompts, transition) -> bool:
-        """Handle prompt encoding and embedding blending.
-
-        Returns True if conditioning embeddings were updated (cross-attn cache
-        needs re-initialization).
-        """
+        """Encode prompts and blend embeddings. Returns True if embeddings changed."""
         prompt_items = self._normalize_prompts(prompts)
         if not prompt_items:
             if self._conditioning_embeds is None:
@@ -354,7 +311,6 @@ class CausalForcingPipeline(Pipeline):
                 return True
             return False
 
-        # Detect changes via signature (text + weight tuples)
         current_signature = tuple((p["text"], p["weight"]) for p in prompt_items)
         conditioning_changed = current_signature != self._last_prompts_signature
         self._last_prompts_signature = current_signature
@@ -362,18 +318,15 @@ class CausalForcingPipeline(Pipeline):
         embeds_updated = False
 
         if conditioning_changed:
-            # Cancel active transition on new prompt change
             if self.blender.is_transitioning():
                 self.blender.cancel_transition()
 
-            # Encode all prompt texts
             texts = [item["text"] for item in prompt_items]
             weights = [item["weight"] for item in prompt_items]
             cond = self.text_encoder(text_prompts=texts)
             batched_embeds = cond["prompt_embeds"]
             embeds_list = [batched_embeds[i : i + 1] for i in range(batched_embeds.shape[0])]
 
-            # Spatial blend to get target embedding
             target_blend = self.blender.blend(
                 embeddings=embeds_list,
                 weights=weights,
@@ -381,10 +334,8 @@ class CausalForcingPipeline(Pipeline):
                 cache_result=False,
             )
 
-            # Apply with or without temporal transition
             tc = parse_transition_config(transition)
             if tc.num_steps > 0 and self._conditioning_embeds is not None:
-                # Smooth transition from current to target over N frames
                 self.blender.start_transition(
                     source_embedding=self._conditioning_embeds,
                     target_embedding=target_blend,
@@ -396,12 +347,10 @@ class CausalForcingPipeline(Pipeline):
                     self._conditioning_embeds = next_emb.to(dtype=self.dtype)
                     embeds_updated = True
             else:
-                # Immediate snap to new embedding
                 self._conditioning_embeds = target_blend.to(dtype=self.dtype)
                 embeds_updated = True
 
         elif self.blender.is_transitioning():
-            # Continue active transition (no new prompt change this frame)
             next_emb = self.blender.get_next_embedding()
             if next_emb is not None:
                 self._conditioning_embeds = next_emb.to(dtype=self.dtype)
@@ -419,28 +368,21 @@ class CausalForcingPipeline(Pipeline):
         prompts = kwargs.get("prompts")
         transition = kwargs.get("transition")
 
-        # Initialize caches and recache buffer on first call
         if self.kv_cache is None:
             self._initialize_caches()
             self._init_recache_buffer()
         elif init_cache:
             self._reset_caches()
 
-        # Handle prompt encoding, spatial blending, and temporal transitions
         embeds_updated = self._update_conditioning(prompts, transition)
         conditional_dict = {"prompt_embeds": self._conditioning_embeds}
 
-        # --- Recaching logic ---
-        # RoPE frequency table boundary → smooth reset.
-        # Re-encode the latent buffer at position 0 to maintain temporal context.
+        # RoPE boundary → smooth reset via recache buffer
         if self.current_start_frame >= MAX_ROPE_SEQ_LEN - self.num_frame_per_block:
             logger.info(
                 "RoPE boundary at frame %d, smooth reset via recache",
                 self.current_start_frame,
             )
-            # Reset cache indices (reuse existing tensor allocations).
-            # VAE cache is NOT cleared — it tracks decoded frames independently
-            # of RoPE positions, so clearing it would cause a visual glitch.
             self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
             self.crossattn_cache = self._make_crossattn_cache(
                 existing=self.crossattn_cache
@@ -450,16 +392,12 @@ class CausalForcingPipeline(Pipeline):
                 self._recache_from_buffer(0, conditional_dict)
                 self.current_start_frame = self._recache_buffer_count
 
-        # Reset cross-attn cache when conditioning changes so it recomputes
         elif embeds_updated and self.crossattn_cache is not None:
             for entry in self.crossattn_cache:
                 entry["is_init"] = False
 
-        # --- Generation ---
+        # VAE stream_decode requires >= 2 latent frames on first batch
         if self.current_start_frame == 0:
-            # First two frames: generate 1 frame at a time to match training
-            # (num_frame_per_block=1), then concatenate for VAE stream_decode
-            # which requires >= 2 latent frames on the first batch.
             frame0 = self._denoise_block(1, conditional_dict)
             self._cache_clean_context(frame0, 1, conditional_dict)
             self.current_start_frame += 1
@@ -470,37 +408,22 @@ class CausalForcingPipeline(Pipeline):
 
             denoised = torch.cat([frame0, frame1], dim=1)
         else:
-            # Normal single-frame generation
             denoised = self._denoise_block(self.num_frame_per_block, conditional_dict)
             self._cache_clean_context(denoised, self.num_frame_per_block, conditional_dict)
             self.current_start_frame += self.num_frame_per_block
 
-        # Update recache buffer
         self._update_recache_buffer(denoised)
-
-        # Decode latent to pixel space
         video = self.vae.decode_to_pixel(denoised, use_cache=True)
 
         return {"video": postprocess_chunk(video)}
 
     def _denoise_block(self, num_frames: int, conditional_dict: dict) -> torch.Tensor:
-        """Run the spatial denoising loop.
-
-        Uses pred_x0 + stochastic re-noising matching the reference
-        causal_inference.py. The DMD checkpoint produces good x0 predictions
-        in 4 steps without CFG.
-
-        Args:
-            num_frames: Number of latent frames to generate in this block.
-            conditional_dict: Text conditioning embeddings.
-
-        Returns:
-            Denoised latent prediction [B, F, C, H_lat, W_lat]
-        """
+        """Run the spatial denoising loop (pred_x0 + stochastic re-noising)."""
         sample = torch.randn(
             [1, num_frames, 16, self.height_latent, self.width_latent],
             device=self.device,
             dtype=self.dtype,
+            generator=self._rng,
         )
 
         current_start = self.current_start_frame * self.frame_seq_length
@@ -526,12 +449,17 @@ class CausalForcingPipeline(Pipeline):
                     current_start=current_start,
                 )
 
-                # Stochastic re-noising to next timestep level
                 next_timestep = self.denoising_step_list[i + 1]
                 flat_x0 = pred_x0.flatten(0, 1)
+                renoise = torch.randn(
+                    flat_x0.shape,
+                    device=flat_x0.device,
+                    dtype=flat_x0.dtype,
+                    generator=self._rng,
+                )
                 sample = self.scheduler.add_noise(
                     flat_x0,
-                    torch.randn_like(flat_x0),
+                    renoise,
                     next_timestep
                     * torch.ones(
                         [flat_x0.shape[0]],
@@ -540,7 +468,6 @@ class CausalForcingPipeline(Pipeline):
                     ),
                 ).unflatten(0, pred_x0.shape[:2])
             else:
-                # Last step: output pred_x0 directly
                 _, pred_x0 = self.generator(
                     noisy_image_or_video=sample,
                     conditional_dict=conditional_dict,
@@ -554,19 +481,7 @@ class CausalForcingPipeline(Pipeline):
         return sample
 
     def _recache_from_buffer(self, recache_start: int, conditional_dict: dict):
-        """Re-encode buffered latents through the generator to rebuild the KV cache.
-
-        Processes frames one-by-one (framewise) so we reuse the normal
-        single-frame attention path without needing block-mask reconfiguration.
-        This mirrors LongLive's ``RecacheFramesBlock`` but in a simpler loop.
-
-        Used at RoPE boundaries to remap the recent context window to position 0,
-        preserving temporal continuity across the reset.
-
-        Args:
-            recache_start: Frame index at which to start writing into the KV cache.
-            conditional_dict: Current text conditioning embeddings.
-        """
+        """Re-encode buffered latents to rebuild KV cache at new positions."""
         n = self._recache_buffer_count
         if n == 0:
             return
@@ -590,7 +505,6 @@ class CausalForcingPipeline(Pipeline):
         )
 
     def _cache_clean_context(self, denoised: torch.Tensor, num_frames: int, conditional_dict: dict):
-        """Re-run generator at timestep=0 to write clean context into KV cache."""
         context_timestep = torch.zeros(
             [1, num_frames],
             device=self.device,
