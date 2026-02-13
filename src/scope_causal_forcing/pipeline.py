@@ -76,6 +76,11 @@ LOCAL_ATTN_SIZE = 21
 # When current_start_frame reaches this limit, caches must be reset.
 MAX_ROPE_SEQ_LEN = 1024
 
+# Periodic KV cache refresh interval (in frames).
+# Re-encodes the latent buffer to scrub accumulated autoregressive drift
+# from the KV cache features.  200 frames ≈ 13s @ 15 fps, ~5 % overhead.
+CACHE_REFRESH_INTERVAL = 200
+
 
 class CausalForcingPipeline(Pipeline):
     @classmethod
@@ -244,6 +249,7 @@ class CausalForcingPipeline(Pipeline):
         # RecacheFramesBlock + PrepareRecacheFramesBlock).
         self._recache_buffer = None
         self._recache_buffer_count = 0
+        self._frames_since_recache = 0
 
     def _resolve_checkpoint_path(self, config) -> str:
         """Resolve the path to the Causal Forcing checkpoint file."""
@@ -322,6 +328,7 @@ class CausalForcingPipeline(Pipeline):
         self._conditioning_embeds = None
         self._last_prompts_signature = None
         self.current_start_frame = 0
+        self._frames_since_recache = 0
         self._init_recache_buffer()
 
     @staticmethod
@@ -472,7 +479,21 @@ class CausalForcingPipeline(Pipeline):
             self.current_start_frame = recache_start
             needs_recache = True
 
-        # Case C: Embeddings changed but no frames generated yet → just reset cross-attn
+        # Case C: Periodic refresh → scrub autoregressive drift from KV cache
+        elif (
+            self._frames_since_recache >= CACHE_REFRESH_INTERVAL
+            and self._recache_buffer_count > 0
+        ):
+            logger.debug(
+                "Periodic cache refresh at frame %d", self.current_start_frame
+            )
+            n = self._recache_buffer_count
+            self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
+            recache_start = max(0, self.current_start_frame - n)
+            self.current_start_frame = recache_start
+            needs_recache = True
+
+        # Case D: Embeddings changed but no frames generated yet → just reset cross-attn
         elif embeds_updated and self.crossattn_cache is not None:
             for entry in self.crossattn_cache:
                 entry["is_init"] = False
@@ -481,6 +502,7 @@ class CausalForcingPipeline(Pipeline):
         if needs_recache and self._recache_buffer_count > 0:
             self._recache_from_buffer(recache_start, conditional_dict)
             self.current_start_frame = recache_start + self._recache_buffer_count
+            self._frames_since_recache = 0
 
         # --- Normal generation (unchanged) ---
         # WanVAE stream_decode requires >= 2 latent frames on the first batch
@@ -495,8 +517,9 @@ class CausalForcingPipeline(Pipeline):
         # Advance frame pointer
         self.current_start_frame += num_frames
 
-        # Update recache buffer with newly generated latents
+        # Update recache buffer and refresh counter
         self._update_recache_buffer(denoised)
+        self._frames_since_recache += num_frames
 
         # Decode latent to pixel space
         video = self.vae.decode_to_pixel(denoised, use_cache=True)
