@@ -19,6 +19,10 @@ from scope.core.pipelines.interface import Pipeline
 from scope.core.pipelines.process import postprocess_chunk
 from scope.core.pipelines.utils import validate_resolution
 from scope.core.pipelines.wan2_1.components import WanDiffusionWrapper, WanTextEncoderWrapper
+from scope.core.pipelines.wan2_1.blocks.setup_caches import (
+    set_all_modules_frame_seq_length,
+    set_all_modules_max_attention_size,
+)
 from scope.core.pipelines.wan2_1.utils import initialize_crossattn_cache, initialize_kv_cache
 from scope.core.pipelines.wan2_1.vae import create_vae
 
@@ -65,6 +69,10 @@ TOTAL_SPATIAL_DOWNSAMPLE = VAE_SPATIAL_DOWNSAMPLE * PATCH_SPATIAL_DOWNSAMPLE  # 
 # Rolling attention window size (in frames).
 # CausalWanModel requires local_attn_size != -1 for KV cache rolling eviction.
 LOCAL_ATTN_SIZE = 21
+
+# RoPE frequency table maximum sequence length (in frames).
+# When current_start_frame reaches this limit, caches must be reset.
+MAX_ROPE_SEQ_LEN = 1024
 
 
 class CausalForcingPipeline(Pipeline):
@@ -118,12 +126,16 @@ class CausalForcingPipeline(Pipeline):
         _sd = _load_sd(cf_ckpt_path)["generator_ema"]
         _sd = {k.removeprefix("model.").removeprefix("_fsdp_wrapped_module."): v for k, v in _sd.items()}
         _result = generator.model.load_state_dict(_sd, assign=True, strict=False)
-        print(f"Reloaded weights: {len(_sd) - len(_result.unexpected_keys)} matched, "
-              f"{len(_result.missing_keys)} missing, {len(_result.unexpected_keys)} unexpected")
+        logger.info(
+            "Reloaded weights: %d matched, %d missing, %d unexpected",
+            len(_sd) - len(_result.unexpected_keys),
+            len(_result.missing_keys),
+            len(_result.unexpected_keys),
+        )
         del _sd
 
         generator = generator.to(device=device, dtype=dtype)
-        print(f"Loaded Causal Forcing generator in {time.time() - start:.3f}s")
+        logger.info("Loaded Causal Forcing generator in %.3fs", time.time() - start)
 
         # Load text encoder (UMT5-XXL, shared with other Wan2.1 pipelines)
         text_encoder_path = str(
@@ -140,7 +152,7 @@ class CausalForcingPipeline(Pipeline):
             tokenizer_path=tokenizer_path,
         )
         text_encoder = text_encoder.to(device=device, dtype=torch.bfloat16)
-        print(f"Loaded text encoder in {time.time() - start:.3f}s")
+        logger.info("Loaded text encoder in %.3fs", time.time() - start)
 
         # Load VAE
         start = time.time()
@@ -150,7 +162,7 @@ class CausalForcingPipeline(Pipeline):
             vae_type=config.vae_type,
         )
         vae = vae.to(device=device, dtype=dtype)
-        print(f"Loaded VAE (type={config.vae_type}) in {time.time() - start:.3f}s")
+        logger.info("Loaded VAE (type=%s) in %.3fs", config.vae_type, time.time() - start)
 
         # Setup scheduler
         self.scheduler = generator.get_scheduler()
@@ -165,7 +177,7 @@ class CausalForcingPipeline(Pipeline):
             torch.tensor([0.0], dtype=torch.float32),
         ])
         self.denoising_step_list = scheduler_timesteps[1000 - raw_steps]
-        print(f"Warped denoising steps: {self.denoising_step_list.tolist()}")
+        logger.info("Warped denoising steps: %s", self.denoising_step_list.tolist())
 
         # Store components
         self.generator = generator
@@ -186,6 +198,18 @@ class CausalForcingPipeline(Pipeline):
 
         # Framewise generation (1 latent frame per block)
         self.num_frame_per_block = 1
+
+        # Configure transformer block attributes (matches SetupCachesBlock behavior).
+        # Sets frame_seq_length and max_attention_size on all submodules so attention
+        # windows and KV cache rolling work correctly.
+        for block in self.generator.model.blocks:
+            block.self_attn.local_attn_size = -1
+            block.self_attn.num_frame_per_block = self.num_frame_per_block
+        self.generator.model.local_attn_size = LOCAL_ATTN_SIZE
+        set_all_modules_frame_seq_length(self.generator, self.frame_seq_length)
+        set_all_modules_max_attention_size(
+            self.generator, LOCAL_ATTN_SIZE * self.frame_seq_length
+        )
 
         # Streaming state - single KV cache (no CFG for DMD checkpoint)
         self.kv_cache = None
@@ -252,7 +276,15 @@ class CausalForcingPipeline(Pipeline):
         elif init_cache:
             self._reset_caches()
 
-        # Handle prompt changes: re-encode text when prompt changes
+        # Auto-reset when approaching RoPE frequency table boundary
+        if self.current_start_frame >= MAX_ROPE_SEQ_LEN - self.num_frame_per_block:
+            logger.info(
+                "RoPE boundary reached (frame %d), resetting caches",
+                self.current_start_frame,
+            )
+            self._reset_caches()
+
+        # Handle prompt changes: re-encode text and reset cross-attention cache
         if prompts and len(prompts) > 0:
             first_prompt = prompts[0]
             new_prompt = (
@@ -263,6 +295,10 @@ class CausalForcingPipeline(Pipeline):
             if new_prompt != self._current_prompt:
                 self.conditional_dict = self.text_encoder(text_prompts=[new_prompt])
                 self._current_prompt = new_prompt
+                # Reset cross-attention cache so it recomputes from new prompt embeddings
+                if self.crossattn_cache is not None:
+                    for entry in self.crossattn_cache:
+                        entry["is_init"] = False
 
         if self.conditional_dict is None:
             self.conditional_dict = self.text_encoder(text_prompts=[""])
