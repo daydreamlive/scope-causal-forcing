@@ -250,6 +250,7 @@ class CausalForcingPipeline(Pipeline):
         self._recache_buffer = None
         self._recache_buffer_count = 0
         self._frames_since_recache = 0
+        self._refresh_cursor = -1  # -1 = idle, 0..N = amortized refresh in progress
 
     def _resolve_checkpoint_path(self, config) -> str:
         """Resolve the path to the Causal Forcing checkpoint file."""
@@ -329,6 +330,7 @@ class CausalForcingPipeline(Pipeline):
         self._last_prompts_signature = None
         self.current_start_frame = 0
         self._frames_since_recache = 0
+        self._refresh_cursor = -1
         self._init_recache_buffer()
 
     @staticmethod
@@ -479,30 +481,35 @@ class CausalForcingPipeline(Pipeline):
             self.current_start_frame = recache_start
             needs_recache = True
 
-        # Case C: Periodic refresh → scrub autoregressive drift from KV cache
+        # Case C: Start periodic amortized refresh when interval is reached
         elif (
-            self._frames_since_recache >= CACHE_REFRESH_INTERVAL
+            self._refresh_cursor < 0
+            and self._frames_since_recache >= CACHE_REFRESH_INTERVAL
             and self._recache_buffer_count > 0
         ):
             logger.debug(
-                "Periodic cache refresh at frame %d", self.current_start_frame
+                "Starting amortized cache refresh at frame %d",
+                self.current_start_frame,
             )
-            n = self._recache_buffer_count
-            self.kv_cache = self._make_kv_cache(existing=self.kv_cache)
-            recache_start = max(0, self.current_start_frame - n)
-            self.current_start_frame = recache_start
-            needs_recache = True
+            self._refresh_cursor = 0
 
         # Case D: Embeddings changed but no frames generated yet → just reset cross-attn
         elif embeds_updated and self.crossattn_cache is not None:
             for entry in self.crossattn_cache:
                 entry["is_init"] = False
 
-        # Execute recache if needed
+        # Execute bulk recache (for RoPE / prompt-change cases)
         if needs_recache and self._recache_buffer_count > 0:
             self._recache_from_buffer(recache_start, conditional_dict)
             self.current_start_frame = recache_start + self._recache_buffer_count
             self._frames_since_recache = 0
+            self._refresh_cursor = -1  # cancel any in-flight amortized refresh
+
+        # Amortized refresh: re-encode ONE buffer frame per generation call.
+        # Uses is_recompute to overwrite stale KV cache entries in-place
+        # without resetting indices — no stutter, no quality dip.
+        if self._refresh_cursor >= 0 and not needs_recache:
+            self._amortized_refresh_step(conditional_dict)
 
         # --- Normal generation (unchanged) ---
         # WanVAE stream_decode requires >= 2 latent frames on the first batch
@@ -595,6 +602,44 @@ class CausalForcingPipeline(Pipeline):
                 sample = pred_x0
 
         return sample
+
+    def _amortized_refresh_step(self, conditional_dict: dict):
+        """Re-encode one buffer frame per call to gradually refresh the KV cache.
+
+        Because the re-encoded positions are behind ``global_end_index``, the
+        CausalWanModel's ``is_recompute`` logic overwrites the stale KV entries
+        in-place without advancing any cache pointers.  This means:
+          - No KV cache reset needed
+          - No ``current_start_frame`` change
+          - No quality dip (full 21-frame context always available)
+          - Cost: one extra forward pass per frame (~35 ms) for 21 frames
+        """
+        n = self._recache_buffer_count
+        idx = self._refresh_cursor
+        if idx >= n:
+            # Refresh complete
+            self._refresh_cursor = -1
+            self._frames_since_recache = 0
+            logger.debug("Amortized cache refresh complete")
+            return
+
+        recache_base = self.current_start_frame - n
+        frame = self._recache_buffer[:, -(n - idx) : -(n - idx) + 1].contiguous()
+        ts = torch.zeros([1, 1], device=self.device, dtype=torch.int64)
+        self.generator(
+            noisy_image_or_video=frame,
+            conditional_dict=conditional_dict,
+            timestep=ts,
+            kv_cache=self.kv_cache,
+            crossattn_cache=self.crossattn_cache,
+            current_start=(recache_base + idx) * self.frame_seq_length,
+        )
+        self._refresh_cursor += 1
+
+        if self._refresh_cursor >= n:
+            self._refresh_cursor = -1
+            self._frames_since_recache = 0
+            logger.debug("Amortized cache refresh complete")
 
     def _recache_from_buffer(self, recache_start: int, conditional_dict: dict):
         """Re-encode buffered latents through the generator to rebuild the KV cache.
