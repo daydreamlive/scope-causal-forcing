@@ -1,5 +1,7 @@
 # scope-causal-forcing
 
+[![Available on Daydream](https://img.shields.io/badge/Daydream-Install_Node-FF6B35?style=flat&logo=data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjQiIGhlaWdodD0iMjQiIHZpZXdCb3g9IjAgMCAyNCAyNCIgZmlsbD0ibm9uZSIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48Y2lyY2xlIGN4PSIxMiIgY3k9IjEyIiByPSIxMCIgZmlsbD0id2hpdGUiLz48L3N2Zz4=)](https://app.daydream.live/nodes/daydreamlive/causal-forcing)
+
 A [Daydream Scope](https://github.com/daydreamlive/scope) plugin that adds the [Causal Forcing](https://github.com/thu-ml/Causal-Forcing) pipeline for real-time streaming video generation.
 
 <p align="center">
